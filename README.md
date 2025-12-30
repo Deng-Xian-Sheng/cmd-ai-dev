@@ -123,6 +123,8 @@ cmd-ai-dev
 cmd-ai-dev /path/to/your/project
 ```
 
+**如果要修改OPENAI_MODEL、OPENAI_BASE_URL、OPENAI_API_KEY则需要先删除已存在的cmd-ai-dev容器，再执行cmd-ai-dev命令**
+
 ## 设计与协议
 
 ### 容器内目录约定
