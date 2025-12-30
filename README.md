@@ -43,6 +43,13 @@ docker run -it --rm \
 
 ```bash
 cmd_ai_dev() {
+  # 关键：用交互子 bash 包一层，避免主 shell 在 Tab 补全时崩溃
+  # 用 CMD_AI_DEV_INNER 防止递归
+  if [ -z "${CMD_AI_DEV_INNER:-}" ]; then
+    CMD_AI_DEV_INNER=1 bash -i -c 'cmd_ai_dev "$@"' bash "$@"
+    return $?
+  fi
+
   set -e
 
   # ====== 你需要填的配置 ======
@@ -71,25 +78,35 @@ cmd_ai_dev() {
     base_url_args=(-e "OPENAI_BASE_URL=$OPENAI_BASE_URL")
   fi
 
+  #（建议）用宿主 UID/GID 运行，避免 /workspace 里出现 root 文件
+  local uidgid
+  uidgid="$(id -u):$(id -g)"
+  local user_run_args=(--user "$uidgid" -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro)
+  local user_exec_args=(-u "$uidgid")
+
   if docker container inspect "$cname" >/dev/null 2>&1; then
+    # 容器存在
     if [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = "true" ]; then
+      # 运行中：exec 进去跑工具（并把 key/model/base_url 注入）
       docker exec -it \
-        -u "$(id -u):$(id -g)" \
+        "${user_exec_args[@]}" \
         -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
         "${base_url_args[@]}" \
         -e "OPENAI_MODEL=$OPENAI_MODEL" \
+        -e "TERM=${TERM:-xterm-256color}" \
         "$cname" cmd-ai-dev
     else
+      # 已存在但未运行：直接 start -ai（注意：env 使用创建容器时的 env；如果你改了 key/model，建议 rm 容器重建）
       docker start -ai "$cname"
     fi
   else
+    # 容器不存在：创建并运行（host 网络 + 映射 /workspace）
     docker run -it --name "$cname" --network host \
-      --user "$(id -u):$(id -g)" \
-      -v /etc/passwd:/etc/passwd:ro \
-      -v /etc/group:/etc/group:ro \
+      "${user_run_args[@]}" \
       -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
       "${base_url_args[@]}" \
       -e "OPENAI_MODEL=$OPENAI_MODEL" \
+      -e "TERM=${TERM:-xterm-256color}" \
       -v "$proj_dir:/workspace" \
       "$IMAGE_NAME"
   fi
@@ -153,6 +170,7 @@ cmd-ai-dev /path/to/your/project
 
 - 终端兼容性：不同终端对 TUI、IME（中文标点等）、选中复制、组合键的支持差异很大。
   - 为降低风险，提供按钮操作与备选快捷键，并将左侧内容落盘到 `/workspace-ai/transcript.log` 作为复制兜底。
+  - 尝试按住shift以实现用鼠标选中文本。
 
 ## 致谢
 

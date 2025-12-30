@@ -338,7 +338,6 @@ class CmdAIDevApp(App):
 
         self.pending_user_buffer: List[str] = []
         self.queue: asyncio.Queue[Tuple[str, str]] = asyncio.Queue()
-        self._stty_state: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -425,18 +424,6 @@ class CmdAIDevApp(App):
         self.write_left_plain("[dim]--- 历史结束 ---[/dim]\n")
 
     def on_mount(self) -> None:
-        # 尝试关闭 XON/XOFF，避免 Ctrl+S 卡住；退出时恢复
-        if sys.stdin.isatty():
-            try:
-                self._stty_state = subprocess.check_output(
-                    ["stty", "-g"],
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                ).strip()
-                subprocess.run(["stty", "-ixon"], stderr=subprocess.DEVNULL, check=False)
-            except Exception:
-                self._stty_state = None
-
         WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
         if not TRANSCRIPT_PATH.exists():
             TRANSCRIPT_PATH.write_text("", encoding="utf-8")
@@ -455,18 +442,6 @@ class CmdAIDevApp(App):
 
         self.run_worker(self.agent_loop(), exclusive=True, name="agent_loop")
 
-    def on_unmount(self) -> None:
-        # 兜底：如果没有走 shutdown()（异常退出等），也尽量恢复终端 stty 状态
-        if self._stty_state and sys.stdin.isatty():
-            try:
-                subprocess.run(
-                    ["stty", self._stty_state],
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            except Exception:
-                pass
-
     async def shutdown(self) -> None:
         self.stop_requested = True
         await self.runner.interrupt()
@@ -474,12 +449,6 @@ class CmdAIDevApp(App):
             self.session.save()
         except Exception:
             pass
-        # 恢复终端 stty 状态（如果之前成功保存过）
-        if self._stty_state and sys.stdin.isatty():
-            try:
-                subprocess.run(["stty", self._stty_state], stderr=subprocess.DEVNULL, check=False)
-            except Exception:
-                pass
         self.exit()
 
     async def action_quit(self) -> None:
@@ -641,7 +610,30 @@ class CmdAIDevApp(App):
 
 def main() -> None:
     WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
-    CmdAIDevApp().run()
+
+    stty_state: Optional[str] = None
+
+    # 在 Textual 接管终端之前保存 stty，并关闭 XON/XOFF（否则 Ctrl+S 可能冻住终端）
+    if sys.stdin.isatty():
+        try:
+            stty_state = subprocess.check_output(
+                ["stty", "-g"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            subprocess.run(["stty", "-ixon"], stderr=subprocess.DEVNULL, check=False)
+        except Exception:
+            stty_state = None
+
+    try:
+        CmdAIDevApp().run()
+    finally:
+        # 无论如何恢复 stty，避免影响用户 shell（Tab/补全等）
+        if stty_state and sys.stdin.isatty():
+            try:
+                subprocess.run(["stty", stty_state], stderr=subprocess.DEVNULL, check=False)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
