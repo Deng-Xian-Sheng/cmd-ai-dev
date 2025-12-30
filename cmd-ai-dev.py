@@ -18,6 +18,7 @@ from rich.markdown import Markdown
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Footer, RichLog, Static, TextArea
+from textual.binding import Binding
 
 from openai import OpenAI
 import subprocess
@@ -303,6 +304,23 @@ class VDivider(Static):
         h = max(1, self.size.height)
         self.update(("│\n" * (h - 1)) + "│")
 
+class InputArea(TextArea):
+    BINDINGS = [
+        Binding("ctrl+a", "select_all", show=False, priority=True),
+        # 有些终端/配置可能把 Ctrl+A 传成 Home；顺手也兼容掉
+        Binding("home", "select_all", show=False, priority=True),
+    ]
+
+    def action_select_all(self) -> None:
+        # Textual 的不同版本 API 可能略有差异，做个兼容
+        if hasattr(self, "select_all"):
+            self.select_all()  # type: ignore[attr-defined]
+            return
+
+        # 兜底：如果基类实现了 action_select_all，就调用基类的
+        base = getattr(super(), "action_select_all", None)
+        if callable(base):
+            base()
 
 class CmdAIDevApp(App):
     # 尽量让终端可选中/可复制：禁用 alternate screen（终端兼容性仍各不相同）
@@ -311,7 +329,6 @@ class CmdAIDevApp(App):
     BINDINGS = [
         ("ctrl+s", "send", "发送"),
         ("f2", "send", "发送(F2)"),
-        ("ctrl+a", "select_all", "全选"),
         ("ctrl+t", "stop", "停止"),
         ("ctrl+r", "reset", "重置"),
         ("ctrl+q", "quit", "退出"),
@@ -350,7 +367,7 @@ class CmdAIDevApp(App):
                     yield Button("停止", id="btn_stop", variant="warning")
                     yield Button("重置", id="btn_reset")
                     yield Button("退出", id="btn_quit", variant="error")
-                yield TextArea(id="right")
+                yield InputArea(id="right")
         yield Footer()
 
     def _left(self) -> RichLog:
@@ -457,15 +474,6 @@ class CmdAIDevApp(App):
 
     async def action_send(self) -> None:
         await self.handle_send()
-
-    async def action_select_all(self) -> None:
-        focused = self.focused
-        if isinstance(focused, TextArea):
-            # 不同 Textual 版本 API 可能略有差异，这里做个兼容
-            if hasattr(focused, "action_select_all"):
-                focused.action_select_all()  # type: ignore[attr-defined]
-            elif hasattr(focused, "select_all"):
-                focused.select_all()  # type: ignore[attr-defined]
 
     async def action_stop(self) -> None:
         await self.handle_stop()
