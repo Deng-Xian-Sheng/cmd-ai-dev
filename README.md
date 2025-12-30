@@ -46,6 +46,12 @@ docker run -it --rm \
 
 ### 方式 B：宿主机一条命令启动（推荐）
 
+在项目目录下：
+
+```bash
+docker build -t cmd-ai-dev:latest .
+```
+
 把下面内容粘贴到 `~/.bashrc`，然后 `source ~/.bashrc`：
 
 ```bash
