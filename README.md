@@ -2,7 +2,11 @@
 
 一个大道至简的命令行 AI 编程工具：在 Docker 容器里让模型通过“只提供命令行”完成编程任务，并用左右分栏 TUI 提升 16:9 屏幕下的可用性。
 
+<img width="2646" height="1739" alt="image" src="https://github.com/user-attachments/assets/d50945fb-1163-4921-9216-c077e1f1d711" />
+
 <img width="2646" height="1739" alt="image" src="https://github.com/user-attachments/assets/ca9f5e09-5a33-4c5b-98ca-56e8ef91dca2" />
+
+<img width="2646" height="1739" alt="image" src="https://github.com/user-attachments/assets/61d9a650-d295-4c7f-9b40-cf4eabb450d6" />
 
 
 ## 安装与使用
