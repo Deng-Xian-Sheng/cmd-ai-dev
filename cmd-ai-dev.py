@@ -311,6 +311,7 @@ class CmdAIDevApp(App):
     BINDINGS = [
         ("ctrl+s", "send", "发送"),
         ("f2", "send", "发送(F2)"),
+        ("ctrl+a", "select_all", "全选"),
         ("ctrl+t", "stop", "停止"),
         ("ctrl+r", "reset", "重置"),
         ("ctrl+q", "quit", "退出"),
@@ -456,6 +457,15 @@ class CmdAIDevApp(App):
 
     async def action_send(self) -> None:
         await self.handle_send()
+
+    async def action_select_all(self) -> None:
+        focused = self.focused
+        if isinstance(focused, TextArea):
+            # 不同 Textual 版本 API 可能略有差异，这里做个兼容
+            if hasattr(focused, "action_select_all"):
+                focused.action_select_all()  # type: ignore[attr-defined]
+            elif hasattr(focused, "select_all"):
+                focused.select_all()  # type: ignore[attr-defined]
 
     async def action_stop(self) -> None:
         await self.handle_stop()
