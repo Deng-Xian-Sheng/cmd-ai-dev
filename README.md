@@ -26,11 +26,6 @@ docker run -it --rm \
   --user "$(id -u):$(id -g)" \
   -v /etc/passwd:/etc/passwd:ro \
   -v /etc/group:/etc/group:ro \
-  -e HOME="$HOME" \
-  -v "$HOME/.gitconfig:$HOME/.gitconfig:ro" \
-  -v "$HOME/.config/git:$HOME/.config/git:ro" \
-  -v "$HOME/.ssh:$HOME/.ssh:ro" \
-  -v "$HOME/.git-credentials:$HOME/.git-credentials:ro" \
   --network host \
   -e OPENAI_API_KEY="你的key" \
   -e OPENAI_MODEL="你的模型名" \
@@ -38,6 +33,20 @@ docker run -it --rm \
   -v "$PWD:/workspace" \
   cmd-ai-dev:latest
 ```
+
+如果你要挂载git配置到容器，并且你拥有以下**每个目录/文件**，则添加：
+
+```bash
+  -e HOME="$HOME" \
+  -v "$HOME/.gitconfig:$HOME/.gitconfig:ro" \
+  -v "$HOME/.config/git:$HOME/.config/git:ro" \
+  -v "$HOME/.ssh:$HOME/.ssh:ro" \
+  -v "$HOME/.git-credentials:$HOME/.git-credentials:ro" \
+```
+
+建议检查这些目录/文件在你的电脑上是否存在，只添加存在的。
+
+比如有的人的电脑没有`$HOME/.config/git`
 
 启动后：
 - 左侧：模型输出 / 命令执行记录
