@@ -292,6 +292,8 @@ class OpenAISDKClient(LLMClient):
 
         return await asyncio.to_thread(_call)
 
+class OtherSDKClient(LLMClient):
+    pass
 
 class VDivider(Static):
     def on_mount(self) -> None:
