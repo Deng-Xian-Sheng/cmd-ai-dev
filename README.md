@@ -26,6 +26,11 @@ docker run -it --rm \
   --user "$(id -u):$(id -g)" \
   -v /etc/passwd:/etc/passwd:ro \
   -v /etc/group:/etc/group:ro \
+  -e HOME="$HOME" \
+  -v "$HOME/.gitconfig:$HOME/.gitconfig:ro" \
+  -v "$HOME/.config/git:$HOME/.config/git:ro" \
+  -v "$HOME/.ssh:$HOME/.ssh:ro" \
+  -v "$HOME/.git-credentials:$HOME/.git-credentials:ro" \
   --network host \
   -e OPENAI_API_KEY="你的key" \
   -e OPENAI_MODEL="你的模型名" \
@@ -94,8 +99,25 @@ cmd_ai_dev() {
   #（建议）用宿主 UID/GID 运行，避免 /workspace 里出现 root 文件
   local uidgid
   uidgid="$(id -u):$(id -g)"
-  local user_run_args=(--user "$uidgid" -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro)
-  local user_exec_args=(-u "$uidgid")
+  local user_run_args=(--user "$uidgid" -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -e HOME="$HOME")
+  local user_exec_args=(-u "$uidgid" -e HOME="$HOME")
+
+  local gitconfig_args=()
+  if [ -e "$HOME/.gitconfig" ]; then
+    gitconfig_args=(-v "$HOME/.gitconfig:$HOME/.gitconfig:ro")
+  fi
+  local config_git_args=()
+  if [ -e "$HOME/.config/git" ]; then
+    config_git_args=(-v "$HOME/.config/git:$HOME/.config/git:ro")
+  fi
+  local ssh_args=()
+  if [ -e "$HOME/.ssh" ]; then
+    ssh_args=(-v "$HOME/.ssh:$HOME/.ssh:ro")
+  fi
+  local git_credentials_args=()
+  if [ -e "$HOME/.git-credentials" ]; then
+    git_credentials_args=(-v "$HOME/.git-credentials:$HOME/.git-credentials:ro")
+  fi
 
   if docker container inspect "$cname" >/dev/null 2>&1; then
     # 容器存在
@@ -116,6 +138,10 @@ cmd_ai_dev() {
     # 容器不存在：创建并运行（host 网络 + 映射 /workspace）
     docker run -it --name "$cname" --network host \
       "${user_run_args[@]}" \
+      "${gitconfig_args[@]}" \
+      "${config_git_args[@]}" \
+      "${ssh_args[@]}" \
+      "${git_credentials_args[@]}" \
       -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
       "${base_url_args[@]}" \
       -e "OPENAI_MODEL=$OPENAI_MODEL" \
