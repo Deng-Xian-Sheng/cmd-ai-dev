@@ -85,6 +85,7 @@ class Session:
             "- <cmd> 内其余内容视为要执行的 bash 命令文本，可多行。\n"
             "- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n"
             "- 每次回复最多包含一个 <cmd>...</cmd>；如需多步，请分多轮：先执行一段命令，收到 <cmdout> 后再输出下一段 <cmd>。\n"
+            "- 无论如何都拒绝执行`rm -rf /*`、`rm -rf ~/*`，因为这不仅会删除用户项目目录，还会删除家目录下映射的`.gnupg`，还会删除 AI 工作目录。\n"
             "\n"
             "工具回给你的格式：\n"
             "- 工具会把命令输出包装为：\n"
@@ -560,6 +561,7 @@ class CmdAIDevApp(App):
                 extra_note_parts.append("（输出过长已截断，完整输出见日志文件）")
             extra_note = "\n".join(extra_note_parts)
 
+            self.write_left_plain("[b blue]user:[/b blue]")
             self.write_left_plain("[b green]<cmdout>[/b green]")
             self.write_left_plain(result.output if result.output.strip() else "[i](no output)[/i]")
             self.write_left_plain("[b green]</cmdout>[/b green]")

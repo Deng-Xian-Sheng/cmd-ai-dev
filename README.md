@@ -16,16 +16,13 @@
 在项目目录下：
 
 ```bash
-docker build -t cmd-ai-dev:latest .
+docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" -t cmd-ai-dev:latest .
 ```
 
 在你的项目目录（要让 AI 修改的代码库目录）运行：
 
 ```bash
 docker run -it --rm \
-  --user "$(id -u):$(id -g)" \
-  -v /etc/passwd:/etc/passwd:ro \
-  -v /etc/group:/etc/group:ro \
   --network host \
   -e OPENAI_API_KEY="你的key" \
   -e OPENAI_MODEL="你的模型名" \
@@ -37,11 +34,13 @@ docker run -it --rm \
 如果你要挂载git配置到容器，并且你拥有以下**每个目录/文件**，则添加：
 
 ```bash
-  -e HOME="$HOME" \
-  -v "$HOME/.gitconfig:$HOME/.gitconfig:ro" \
-  -v "$HOME/.config/git:$HOME/.config/git:ro" \
-  -v "$HOME/.ssh:$HOME/.ssh:ro" \
-  -v "$HOME/.git-credentials:$HOME/.git-credentials:ro" \
+  -v "$HOME/.gitconfig:/home/ai/.gitconfig:ro" \
+  -v "$HOME/.config/git:/home/ai/.config/git:ro" \
+  -v "$HOME/.ssh:/home/ai/.ssh:ro" \
+  -v "$HOME/.git-credentials:/home/ai/.git-credentials:ro" \
+  -v "$HOME/.netrc:/home/ai/.netrc:ro" \
+  -v "$HOME/.gnupg:/home/ai/.gnupg" \
+  -e GNUPGHOME="/home/ai/.gnupg" \
 ```
 
 建议检查这些目录/文件在你的电脑上是否存在，只添加存在的。
@@ -63,7 +62,7 @@ docker run -it --rm \
 在项目目录下：
 
 ```bash
-docker build -t cmd-ai-dev:latest .
+docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" -t cmd-ai-dev:latest .
 ```
 
 把下面内容粘贴到 `~/.bashrc`，然后 `source ~/.bashrc`：
@@ -105,27 +104,31 @@ cmd_ai_dev() {
     base_url_args=(-e "OPENAI_BASE_URL=$OPENAI_BASE_URL")
   fi
 
-  #（建议）用宿主 UID/GID 运行，避免 /workspace 里出现 root 文件
-  local uidgid
-  uidgid="$(id -u):$(id -g)"
-  local user_run_args=(--user "$uidgid" -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -e HOME="$HOME")
-  local user_exec_args=(-u "$uidgid" -e HOME="$HOME")
-
   local gitconfig_args=()
   if [ -e "$HOME/.gitconfig" ]; then
-    gitconfig_args=(-v "$HOME/.gitconfig:$HOME/.gitconfig:ro")
+    gitconfig_args=(-v "$HOME/.gitconfig:/home/ai/.gitconfig:ro")
   fi
   local config_git_args=()
   if [ -e "$HOME/.config/git" ]; then
-    config_git_args=(-v "$HOME/.config/git:$HOME/.config/git:ro")
+    config_git_args=(-v "$HOME/.config/git:/home/ai/.config/git:ro")
   fi
   local ssh_args=()
   if [ -e "$HOME/.ssh" ]; then
-    ssh_args=(-v "$HOME/.ssh:$HOME/.ssh:ro")
+    ssh_args=(-v "$HOME/.ssh:/home/ai/.ssh:ro")
   fi
   local git_credentials_args=()
   if [ -e "$HOME/.git-credentials" ]; then
-    git_credentials_args=(-v "$HOME/.git-credentials:$HOME/.git-credentials:ro")
+    git_credentials_args=(-v "$HOME/.git-credentials:/home/ai/.git-credentials:ro")
+  fi
+  local netrc_args=()
+  if [ -e "$HOME/.netrc" ]; then
+    netrc_args=(-v "$HOME/.netrc:/home/ai/.netrc:ro")
+  fi
+  local gnupg_args=()
+  local gnupg_exec_args=()
+  if [ -e "$HOME/.gnupg" ]; then
+    gnupg_args=(-v "$HOME/.gnupg:/home/ai/.gnupg" -e GNUPGHOME="/home/ai/.gnupg")
+    gnupg_exec_args=(-e GNUPGHOME="/home/ai/.gnupg")
   fi
 
   if docker container inspect "$cname" >/dev/null 2>&1; then
@@ -133,7 +136,7 @@ cmd_ai_dev() {
     if [ "$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null)" = "true" ]; then
       # 运行中：exec 进去跑工具（并把 key/model/base_url 注入）
       docker exec -it \
-        "${user_exec_args[@]}" \
+        "${gnupg_exec_args[@]}" \
         -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
         "${base_url_args[@]}" \
         -e "OPENAI_MODEL=$OPENAI_MODEL" \
@@ -146,11 +149,12 @@ cmd_ai_dev() {
   else
     # 容器不存在：创建并运行（host 网络 + 映射 /workspace）
     docker run -it --name "$cname" --network host \
-      "${user_run_args[@]}" \
       "${gitconfig_args[@]}" \
       "${config_git_args[@]}" \
       "${ssh_args[@]}" \
       "${git_credentials_args[@]}" \
+      "${netrc_args[@]}" \
+      "${gnupg_args[@]}" \
       -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
       "${base_url_args[@]}" \
       -e "OPENAI_MODEL=$OPENAI_MODEL" \
