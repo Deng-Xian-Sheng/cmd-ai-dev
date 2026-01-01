@@ -226,6 +226,11 @@ cmd-ai-dev /path/to/your/project
   - 为降低风险，提供按钮操作与备选快捷键，并将左侧内容落盘到 `/workspace-ai/transcript.log` 作为复制兜底。
   - 尝试按住shift以实现用鼠标选中文本。
 
+## 小技巧
+
+- 如果想查看AI工作目录的文件，你可以告诉它“请你打开vscode的web ide”
+- 你可以对接OpenAI API之外的任何接口/平台，将它作为支撑AI编程工具的模型。
+
 ## 致谢
 
 本项目在编写过程中参考并借助了 GPT-5.2-High 生成的代码建议与改进方案。
