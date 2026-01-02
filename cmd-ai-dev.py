@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from rich.markdown import Markdown
+from rich.text import Text
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -157,7 +158,13 @@ def parse_assistant(text: str) -> ParsedAssistant:
     return ParsedAssistant(raw=text, cmd=cmd, timeout_sec=timeout, answer_without_cmd=answer_wo)
 
 
-def format_cmdout(exit_code: Optional[int], timed_out: bool, interrupted: bool, output: str, extra_note: Optional[str] = None) -> str:
+def format_cmdout(
+    exit_code: Optional[int],
+    timed_out: bool,
+    interrupted: bool,
+    output: str,
+    extra_note: Optional[str] = None,
+) -> str:
     header = f"[exit={exit_code} timeout={int(timed_out)} interrupted={int(interrupted)}]"
     body = output
     if extra_note:
@@ -196,7 +203,7 @@ class CommandRunner:
         WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
         log_path = WORKSPACE_AI / f"cmdout_{now_ts()}.log"
 
-        # 关键修复：输出落盘，避免 nohup/& 后台继承 PIPE 导致 communicate() 卡死
+        # 输出落盘：避免后台进程继承 PIPE 导致 communicate 卡死
         with log_path.open("wb") as logf:
             self._proc = await asyncio.create_subprocess_exec(
                 "bash",
@@ -226,7 +233,6 @@ class CommandRunner:
                 rc = self._proc.returncode if self._proc else None
                 self._proc = None
 
-        # 读出当前日志内容（后台进程可能还会继续写，但不影响本次返回）
         raw = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
         truncated = False
         output = raw
@@ -293,8 +299,10 @@ class OpenAISDKClient(LLMClient):
 
         return await asyncio.to_thread(_call)
 
+
 class OtherSDKClient(LLMClient):
     pass
+
 
 class VDivider(Static):
     def on_mount(self) -> None:
@@ -307,26 +315,23 @@ class VDivider(Static):
         h = max(1, self.size.height)
         self.update(("│\n" * (h - 1)) + "│")
 
+
 class InputArea(TextArea):
     BINDINGS = [
         Binding("ctrl+a", "select_all", show=False, priority=True),
-        # 有些终端/配置可能把 Ctrl+A 传成 Home；顺手也兼容掉
         Binding("home", "select_all", show=False, priority=True),
     ]
 
     def action_select_all(self) -> None:
-        # Textual 的不同版本 API 可能略有差异，做个兼容
         if hasattr(self, "select_all"):
             self.select_all()  # type: ignore[attr-defined]
             return
-
-        # 兜底：如果基类实现了 action_select_all，就调用基类的
         base = getattr(super(), "action_select_all", None)
         if callable(base):
             base()
 
+
 class CmdAIDevApp(App):
-    # 尽量让终端可选中/可复制：禁用 alternate screen（终端兼容性仍各不相同）
     USE_ALTERNATE_SCREEN = False
 
     BINDINGS = [
@@ -360,6 +365,9 @@ class CmdAIDevApp(App):
         self.pending_user_buffer: List[str] = []
         self.queue: asyncio.Queue[Tuple[str, str]] = asyncio.Queue()
 
+        # reset 时 bump：让 reset 前的 LLM/命令结果全部自动作废
+        self.epoch: int = 0
+
     def compose(self) -> ComposeResult:
         with Horizontal():
             yield RichLog(id="left", wrap=True, highlight=True, markup=True)
@@ -376,48 +384,73 @@ class CmdAIDevApp(App):
     def _left(self) -> RichLog:
         return self.query_one("#left", RichLog)
 
-    def write_left_plain(self, text: str) -> None:
+    # ===== 输出：trusted vs untrusted =====
+    def write_left_markup(self, text: str) -> None:
+        """可信内容：允许 rich markup（你自己写的 [b red]...[/b red] 等）。"""
         self._left().write(text)
         append_transcript(str(text))
 
+    def write_left_text(self, text: str) -> None:
+        """不可信内容：用 Text() 绕过 markup 解析，避免 [..] 触发富文本标签。"""
+        self._left().write(Text(text))
+        append_transcript(str(text))
+
     def write_left_markdown(self, md_text: str) -> None:
-        # Rich Markdown 渲染；transcript 仍写纯文本
         self._left().write(Markdown(md_text))
         append_transcript(md_text)
-    
+
+    # ===== pending flush / queue drain =====
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                _ = self.queue.get_nowait()
+                self.queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+    def _flush_pending_as_user_turn(self) -> None:
+        """把 busy 期间用户发送的内容作为下一条 user 消息送给模型（避免卡住/丢失）。"""
+        if not self.pending_user_buffer:
+            return
+        pending = "\n".join(self.pending_user_buffer).strip()
+        self.pending_user_buffer.clear()
+        if not pending:
+            return
+
+        # 重要：pending 等价于“用户继续对话”，不应该被旧的 stop 标记影响
+        self.stop_requested = False
+        self.queue.put_nowait(("user", pending))
+
     def render_assistant_content(self, assistant_text: str) -> None:
         parsed = parse_assistant(assistant_text)
 
         narrative = parsed.answer_without_cmd.strip()
         if narrative:
             self.write_left_markdown(narrative)
-            self.write_left_plain("")
+            self.write_left_text("")
 
         if parsed.cmd:
             timeout_sec = parsed.timeout_sec if parsed.timeout_sec > 0 else DEFAULT_TIMEOUT_SEC
-            self.write_left_plain("[b magenta]<cmd>[/b magenta]")
-            self.write_left_plain(parsed.cmd)
-            self.write_left_plain("[b magenta]</cmd>[/b magenta]")
-            self.write_left_plain(f"[dim]timeout={timeout_sec}s[/dim]\n")
+            self.write_left_markup("[b magenta]<cmd>[/b magenta]")
+            self.write_left_text(parsed.cmd + "\n")
+            self.write_left_markup("[b magenta]</cmd>[/b magenta]")
+            self.write_left_markup(f"[dim]timeout={timeout_sec}s[/dim]\n")
 
     def render_user_content(self, user_text: str) -> None:
-        # 如果是 <cmdout>，就用工具样式展示；其余内容原样展示
         m = CMDOUT_BLOCK_RE.search(user_text or "")
         if m:
             inner = m.group(1).strip()
-            self.write_left_plain("[b green]<cmdout>[/b green]")
-            self.write_left_plain(inner if inner else "[i](no output)[/i]")
-            self.write_left_plain("[b green]</cmdout>[/b green]\n")
+            self.write_left_markup("[b green]<cmdout>[/b green]")
+            self.write_left_text((inner if inner else "(no output)") + "\n")
+            self.write_left_markup("[b green]</cmdout>[/b green]\n")
 
-            rest = (user_text[:m.start()] + user_text[m.end():]).strip()
+            rest = (user_text[: m.start()] + user_text[m.end() :]).strip()
             if rest:
-                self.write_left_plain(rest + "\n")
+                self.write_left_text(rest + "\n")
         else:
-            # 用户文本一般不需要 markdown 渲染，保持最原始最稳
-            self.write_left_plain((user_text or "").strip() + "\n")
+            self.write_left_text((user_text or "").strip() + "\n")
 
     def replay_history_to_left(self) -> None:
-        # 默认只重放最近 N 条，防止 session 太大刷屏
         max_n = int(os.environ.get("CMD_AI_DEV_REPLAY", "80"))
         history = self.session.messages[1:]  # skip system
         if max_n > 0 and len(history) > max_n:
@@ -426,39 +459,38 @@ class CmdAIDevApp(App):
         if not history:
             return
 
-        self.write_left_plain(f"[dim]--- 已恢复历史消息（最近 {len(history)} 条，可用 CMD_AI_DEV_REPLAY 调整） ---[/dim]\n")
+        self.write_left_markup(f"[dim]--- 已恢复历史消息（最近 {len(history)} 条，可用 CMD_AI_DEV_REPLAY 调整） ---[/dim]\n")
 
         for msg in history:
             role = msg.get("role")
             content = msg.get("content", "")
 
             if role == "user":
-                self.write_left_plain("[b blue]user:[/b blue]")
+                self.write_left_markup("[b blue]user:[/b blue]")
                 self.render_user_content(content)
             elif role == "assistant":
-                self.write_left_plain("[b cyan]assistant:[/b cyan]")
+                self.write_left_markup("[b cyan]assistant:[/b cyan]")
                 self.render_assistant_content(content)
             else:
-                # 其它 role（如 system/tool）默认不展示，避免噪音
                 continue
 
-        self.write_left_plain("[dim]--- 历史结束 ---[/dim]\n")
+        self.write_left_markup("[dim]--- 历史结束 ---[/dim]\n")
 
     def on_mount(self) -> None:
         WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
         if not TRANSCRIPT_PATH.exists():
             TRANSCRIPT_PATH.write_text("", encoding="utf-8")
 
-        self.write_left_plain("[b]cmd-ai-dev[/b]  Ctrl+S发送 | Ctrl+T停止 | Ctrl+R重置 | Ctrl+Q退出 | F2发送")
-        self.write_left_plain(f"WORKSPACE={WORKSPACE}")
-        self.write_left_plain(f"WORKSPACE_AI={WORKSPACE_AI}")
-        self.write_left_plain(f"SESSION={SESSION_PATH}")
-        self.write_left_plain(f"VENV_BIN={VENV_BIN}")
-        self.write_left_plain(f"TRANSCRIPT={TRANSCRIPT_PATH}")
-        self.write_left_plain("")
+        self.write_left_markup("[b]cmd-ai-dev[/b]  Ctrl+S发送 | Ctrl+T停止 | Ctrl+R重置 | Ctrl+Q退出 | F2发送")
+        self.write_left_text(f"WORKSPACE={WORKSPACE}\n")
+        self.write_left_text(f"WORKSPACE_AI={WORKSPACE_AI}\n")
+        self.write_left_text(f"SESSION={SESSION_PATH}\n")
+        self.write_left_text(f"VENV_BIN={VENV_BIN}\n")
+        self.write_left_text(f"TRANSCRIPT={TRANSCRIPT_PATH}\n")
+        self.write_left_text("\n")
 
         if len(self.session.messages) > 1:
-            self.write_left_plain("[i]已加载现有会话：/workspace-ai/session.json[/i]\n")
+            self.write_left_markup("[i]已加载现有会话：/workspace-ai/session.json[/i]\n")
             self.replay_history_to_left()
 
         self.run_worker(self.agent_loop(), exclusive=True, name="agent_loop")
@@ -498,14 +530,26 @@ class CmdAIDevApp(App):
     async def agent_loop(self) -> None:
         while True:
             role, content = await self.queue.get()
+            my_epoch = self.epoch
+
+            # 这条 user 消息进入会话（如果之后 reset 删除 session.json，也会被清掉）
             self.session.add(role, content)
             self.busy = True
 
-            self.write_left_plain("[b cyan]assistant:[/b cyan] (generating...)")
+            self.write_left_markup("[b cyan]assistant:[/b cyan] (generating...)")
+
             try:
                 assistant_text = await self.llm.stream_chat(self.session.messages)
             except Exception as e:
-                self.write_left_plain(f"[b red]LLM error:[/b red] {e}\n")
+                # LLM 出错：结束 busy，并把 pending 继续送出去（否则 pending 卡死）
+                self.write_left_markup(f"[b red]LLM error:[/b red] {e}\n")
+                self.busy = False
+                if my_epoch == self.epoch:
+                    self._flush_pending_as_user_turn()
+                continue
+
+            # reset 期间产生的旧结果：直接作废，不写 UI、不写 session、不执行命令
+            if my_epoch != self.epoch:
                 self.busy = False
                 continue
 
@@ -514,36 +558,47 @@ class CmdAIDevApp(App):
 
             parsed = parse_assistant(assistant_text)
 
-            # 展示：叙述部分走 markdown；cmd 单独展示，避免重复
             narrative = parsed.answer_without_cmd.strip()
             if narrative:
                 self.write_left_markdown(narrative)
-                self.write_left_plain("")
+                self.write_left_text("\n")
 
+            # STOP：允许输出完“模型文字”，但不执行命令
             if self.stop_requested:
                 note = (
                     "<system_note>\n"
                     "用户触发 STOP：已停止命令链；任何待执行命令已取消；如需继续，请等待用户新指令。\n"
                     "</system_note>"
                 )
+                # 仍记录到会话，作为模型下一轮上下文
                 self.session.add("user", note)
-                self.write_left_plain("[yellow]STOP 已触发：不会执行模型给出的命令。[/yellow]\n")
+
+                self.write_left_markup("[yellow]STOP 已触发：不会执行模型给出的命令。[/yellow]\n")
                 self.busy = False
+
+                # 关键：本轮结束时把 busy 期间用户输入 flush 掉，避免 pending 卡死
+                self._flush_pending_as_user_turn()
                 continue
 
             if not parsed.cmd:
                 self.busy = False
+                self._flush_pending_as_user_turn()
                 continue
 
             cmd_to_run = parsed.cmd
             timeout_sec = parsed.timeout_sec if parsed.timeout_sec > 0 else DEFAULT_TIMEOUT_SEC
 
-            self.write_left_plain("[b magenta]<cmd>[/b magenta]")
-            self.write_left_plain(cmd_to_run)
-            self.write_left_plain("[b magenta]</cmd>[/b magenta]")
-            self.write_left_plain(f"[dim]timeout={timeout_sec}s[/dim]\n")
+            self.write_left_markup("[b magenta]<cmd>[/b magenta]")
+            self.write_left_text(cmd_to_run + "\n")
+            self.write_left_markup("[b magenta]</cmd>[/b magenta]")
+            self.write_left_markup(f"[dim]timeout={timeout_sec}s[/dim]\n")
 
             result = await self.runner.run(cmd_to_run, timeout_sec=timeout_sec, cwd=WORKSPACE)
+
+            # reset 期间的旧结果：作废
+            if my_epoch != self.epoch:
+                self.busy = False
+                continue
 
             if self.stop_requested or result.interrupted:
                 note = (
@@ -552,8 +607,10 @@ class CmdAIDevApp(App):
                     "</system_note>"
                 )
                 self.session.add("user", note)
-                self.write_left_plain("[yellow]STOP：命令结果未发送给模型。[/yellow]\n")
+                self.write_left_markup("[yellow]STOP：命令结果未发送给模型。[/yellow]\n")
                 self.busy = False
+
+                self._flush_pending_as_user_turn()
                 continue
 
             extra_note_parts = [f"(命令输出日志：{result.log_path})"]
@@ -561,11 +618,11 @@ class CmdAIDevApp(App):
                 extra_note_parts.append("（输出过长已截断，完整输出见日志文件）")
             extra_note = "\n".join(extra_note_parts)
 
-            self.write_left_plain("[b blue]user:[/b blue]")
-            self.write_left_plain("[b green]<cmdout>[/b green]")
-            self.write_left_plain(result.output if result.output.strip() else "[i](no output)[/i]")
-            self.write_left_plain("[b green]</cmdout>[/b green]")
-            self.write_left_plain(f"[dim]{extra_note}[/dim]\n")
+            self.write_left_markup("[b blue]user:[/b blue]")
+            self.write_left_markup("[b green]<cmdout>[/b green]")
+            self.write_left_text((result.output if result.output.strip() else "(no output)") + "\n")
+            self.write_left_markup("[b green]</cmdout>[/b green]")
+            self.write_left_markup(f"[dim]{extra_note}[/dim]\n")
 
             user_extra = ""
             if self.pending_user_buffer:
@@ -595,7 +652,7 @@ class CmdAIDevApp(App):
             self.stop_requested = False
 
         if text in ("/help", ":help"):
-            self.write_left_plain("命令：/help  /reset  /exit\n快捷键：Ctrl+S发送 Ctrl+T停止 Ctrl+R重置 Ctrl+Q退出 F2发送\n")
+            self.write_left_text("命令：/help  /reset  /exit\n快捷键：Ctrl+S发送 Ctrl+T停止 Ctrl+R重置 Ctrl+Q退出 F2发送\n")
             return
         if text in ("/exit", ":q", ":quit"):
             await self.shutdown()
@@ -604,8 +661,8 @@ class CmdAIDevApp(App):
             await self.handle_reset()
             return
 
-        self.write_left_plain("[b blue]user:[/b blue]")
-        self.write_left_plain(text + "\n")
+        self.write_left_markup("[b blue]user:[/b blue]")
+        self.write_left_text(text + "\n\n")
 
         if self.busy:
             self.pending_user_buffer.append(text)
@@ -614,21 +671,37 @@ class CmdAIDevApp(App):
         self.queue.put_nowait(("user", text))
 
     async def handle_stop(self) -> None:
+        # STOP 不 bump epoch：目的是“让模型输出完文字”，但不执行 cmd
         self.stop_requested = True
         await self.runner.interrupt()
-        self.write_left_plain("[yellow]STOP 请求已发送：将中断命令链（命令会被终止/丢弃）。[/yellow]\n")
+        self.write_left_markup("[yellow]STOP 请求已发送：将中断命令链（命令会被终止/丢弃）。[/yellow]\n")
 
     async def handle_reset(self) -> None:
+        # reset 需要更强：作废旧结果 + 停命令 + 清队列
+        self.epoch += 1
+
+        # 先停命令（不要求停掉 LLM 生成，但 epoch 会让结果作废）
+        self.stop_requested = True
+        await self.runner.interrupt()
+
+        # 清空队列与 pending，避免 reset 后旧消息继续驱动链路
+        self._drain_queue()
+        self.pending_user_buffer.clear()
+
+        # 重置会话文件
         if SESSION_PATH.exists():
             SESSION_PATH.unlink()
+
         self.session = Session.load_or_create()
-        self.pending_user_buffer.clear()
+
         self.stop_requested = False
         self.busy = False
-        self._left().clear()
-        self.write_left_plain("[b]会话已重置[/b]")
-        self.write_left_plain(f"SESSION={SESSION_PATH}\n")
 
+        self._left().clear()
+        self.write_left_markup("[b]会话已重置[/b]")
+        self.write_left_text(f"SESSION={SESSION_PATH}\n")
+
+        # reset 后不自动 flush pending（已经 clear 了）
 
 def main() -> None:
     WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
