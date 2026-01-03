@@ -230,6 +230,7 @@ cmd-ai-dev /path/to/your/project
 
 - 如果想查看AI工作目录的文件，你可以告诉它“请你运行/usr/bin/code-server，不要设置密码。”
 - 你可以对接OpenAI API之外的任何接口/平台，将它作为支持AI编程工具的模型。
+- 你可以在容器外宿主机上执行`google-chrome --remote-debugging-port=9222 --user-data-dir=./cdp-profile`，这将打开一个浏览器，然后你取消这段代码`self.llm: LLMClient = ChatZAISDKClient()`的注释并重新构建镜像，就可以将 https://chat.z.ai 网站作为支持AI编程工具的模型了。执行命令时，如果找不到google-chrome，你需要指定google-chrome二进制可执行文件的路径。
 
 ## 致谢
 
