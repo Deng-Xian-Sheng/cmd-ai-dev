@@ -2,7 +2,7 @@ FROM docker.cnb.cool/cnb/cool/default-dev-env/dockerfile-caches:ba8c7bf15bfb07de
 
 # 保险起见：确认 python3/pip 存在（大多数 dev-env 已经有）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv python3-dev bash git ca-certificates curl gnupg sudo \
+    python3 python3-pip python3-venv python3-dev bash git ca-certificates curl gnupg sudo ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # venv环境

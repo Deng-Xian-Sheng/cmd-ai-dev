@@ -25,6 +25,11 @@ from openai import OpenAI
 import subprocess
 import sys
 
+import io
+from markitdown import MarkItDown
+os.environ["NODE_NO_WARNINGS"] = "1"
+from playwright.async_api import async_playwright, Page, Playwright, Browser, TimeoutError as PlaywrightTimeoutError
+
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace"))
 WORKSPACE_AI = Path(os.environ.get("WORKSPACE_AI", "/workspace-ai"))
 SESSION_PATH = WORKSPACE_AI / "session.json"
@@ -299,10 +304,124 @@ class OpenAISDKClient(LLMClient):
 
         return await asyncio.to_thread(_call)
 
+class ChatZAISDKClient(LLMClient):
+    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", 
+                 url: str = "https://chat.z.ai"):
+        """
+        初始化客户端配置
+        :param cdp_url: 浏览器的 CDP 调试地址
+        :param url: 目标聊天页面 URL
+        """
+        self.cdp_url = cdp_url
+        self.target_url = url
+        
+        # 页面选择器配置
+        self.input_selector = "#chat-input"
+        self.assistant_bubble_selector = "#response-content-container"
+        
+        # 工具初始化
+        self.md = MarkItDown(enable_plugins=False)
+        
+        # Playwright 对象状态管理
+        self._playwright: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
+        self._page: Optional[Page] = None
 
-class OtherSDKClient(LLMClient):
-    pass
+    async def _ensure_page_ready(self):
+        """
+        惰性连接浏览器：如果尚未连接或页面关闭，则重新连接
+        """
+        if self._page and not self._page.is_closed():
+            return
 
+        # 启动 Playwright 并连接 CDP
+        self._playwright = await async_playwright().start()
+        try:
+            self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
+            context = self._browser.contexts[0]
+            # 获取第一个页面，如果没有则新建
+            self._page = context.pages[0] if context.pages else await context.new_page()
+
+            # 确保在正确的 URL
+            if not self._page.url.startswith(self.target_url):
+                await self._page.goto(self.target_url)
+                
+        except Exception as e:
+            # 如果连接失败，清理资源
+            await self.close()
+            raise RuntimeError(f"无法连接到浏览器 CDP ({self.cdp_url})。请确保浏览器已通过 --remote-debugging-port=9222 启动。") from e
+
+    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
+        """
+        实现 LLMClient 的标准接口
+        注意：网页版对话通常有上下文记忆，因此这里我们只提取 messages 中的最后一条用户消息发送。
+        """
+        await self._ensure_page_ready()
+        page = self._page
+
+        # 1. 解析输入：处理特殊的 System + User 拼接逻辑
+        if len(messages) == 2 and messages[0].get('role') == 'system' and messages[1].get('role') == 'user':
+            # 如果只有两条，且是 System + User，进行拼接
+            system_content = messages[0].get('content', '')
+            user_content = messages[1].get('content', '')
+            prompt = f"{system_content}\n提示：记得，你拥有搜索网络的工具，合理利用它。\n提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n用户消息：\n{user_content}"
+        else:
+            # 否则：提取最后一条 user 消息
+            prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
+
+        if not prompt:
+            raise ValueError("messages 中没有找到有效的 user 消息内容")
+
+        timeout_ms = 1000 * 60 * 5 # 5分钟超时
+
+        input_box = page.locator(self.input_selector)
+        assistant_bubbles = page.locator(self.assistant_bubble_selector)
+
+        # 3. 输入并发送
+        # 确保输入框可见且可操作
+        await input_box.wait_for(state="visible")
+        await input_box.click()
+        await input_box.fill(prompt)
+        await page.locator("#send-message-button").click()
+
+        await page.locator('#send-message-button').wait_for(state="attached", timeout=timeout_ms)
+
+        last_bubble = assistant_bubbles.nth(-1)
+
+        # 7. 清洗 HTML (去除思考过程)
+        html_content = await last_bubble.locator("> div").first.evaluate("""(node) => {
+            const clone = node.cloneNode(true);
+            
+            const selectorsToRemove = [
+                '.thinking-chain-container', 
+                '.thinking-block',
+                '.w-full.overflow-hidden.h-0' 
+            ];
+
+            selectorsToRemove.forEach(selector => {
+                const elements = clone.querySelectorAll(selector);
+                elements.forEach(el => el.remove());
+            });
+
+            return clone.innerHTML;
+        }""")
+
+        # 8. 转换为 Markdown
+        # 包装成简单的 HTML 结构以供 markitdown 解析
+        wrapped_html = f"<!doctype html><html><body>{html_content}</body></html>"
+        markdown_text = self.md.convert(io.BytesIO(wrapped_html.encode("utf-8"))).text_content.replace("<time\\_out>", "<time_out>").replace("</time\\_out>", "</time_out>")
+        
+        return markdown_text
+
+    async def close(self):
+        """清理资源"""
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+        self._browser = None
+        self._playwright = None
+        self._page = None        
 
 class VDivider(Static):
     def on_mount(self) -> None:
@@ -356,7 +475,10 @@ class CmdAIDevApp(App):
     def __init__(self) -> None:
         super().__init__()
         self.session = Session.load_or_create()
-        self.llm: LLMClient = OpenAISDKClient()
+        # OpenAISDKClient API的形式，支持OpenAI API格式的API
+        # ChatZAISDKClient https://chat.z.ai 网站的形式
+        # self.llm: LLMClient = OpenAISDKClient()
+        self.llm: LLMClient = ChatZAISDKClient()
         self.runner = CommandRunner()
 
         self.busy: bool = False

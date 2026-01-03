@@ -228,7 +228,7 @@ cmd-ai-dev /path/to/your/project
 
 ## 小技巧
 
-- 如果想查看AI工作目录的文件，你可以告诉它“请你运行/usr/bin/code-server”
+- 如果想查看AI工作目录的文件，你可以告诉它“请你运行/usr/bin/code-server，不要设置密码。”
 - 你可以对接OpenAI API之外的任何接口/平台，将它作为支持AI编程工具的模型。
 
 ## 致谢
