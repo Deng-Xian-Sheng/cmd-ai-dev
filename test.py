@@ -40,7 +40,8 @@ class ChatBot:
             const selectorsToRemove = [
                 '.thinking-chain-container', 
                 '.thinking-block',
-                '.w-full.overflow-hidden.h-0' // 针对你代码片段中折叠区域的容器
+                '.w-full.overflow-hidden.h-0', // 针对你代码片段中折叠区域的容器
+                '.cursor-default'
             ];
 
             selectorsToRemove.forEach(selector => {

@@ -364,7 +364,7 @@ class ChatZAISDKClient(LLMClient):
             # 如果只有两条，且是 System + User，进行拼接
             system_content = messages[0].get('content', '')
             user_content = messages[1].get('content', '')
-            prompt = f"{system_content}\n提示：记得，你拥有搜索网络的工具，合理利用它。\n提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n用户消息：\n{user_content}"
+            prompt = f"{system_content}\n提示：记得，你拥有搜索网络的工具：search、open、click、find，合理利用它们。\n提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n用户消息：\n{user_content}"
         else:
             # 否则：提取最后一条 user 消息
             prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
@@ -395,7 +395,8 @@ class ChatZAISDKClient(LLMClient):
             const selectorsToRemove = [
                 '.thinking-chain-container', 
                 '.thinking-block',
-                '.w-full.overflow-hidden.h-0' 
+                '.w-full.overflow-hidden.h-0', 
+                '.cursor-default'
             ];
 
             selectorsToRemove.forEach(selector => {
