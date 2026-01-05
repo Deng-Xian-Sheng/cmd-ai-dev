@@ -410,7 +410,7 @@ class ChatZAISDKClient(LLMClient):
         # 8. 转换为 Markdown
         # 包装成简单的 HTML 结构以供 markitdown 解析
         wrapped_html = f"<!doctype html><html><body>{html_content}</body></html>"
-        markdown_text = self.md.convert(io.BytesIO(wrapped_html.encode("utf-8"))).text_content.replace("<time\\_out>", "<time_out>").replace("</time\\_out>", "</time_out>")
+        markdown_text = self.md.convert(io.BytesIO(wrapped_html.encode("utf-8"))).text_content.replace("\\_", "_")
         
         return markdown_text
 
