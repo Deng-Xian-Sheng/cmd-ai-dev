@@ -25,8 +25,8 @@ from openai import OpenAI
 import subprocess
 import sys
 
-import io
-from markitdown import MarkItDown
+from bs4 import BeautifulSoup
+from markdownify import MarkdownConverter
 os.environ["NODE_NO_WARNINGS"] = "1"
 from playwright.async_api import async_playwright, Page, Playwright, Browser, TimeoutError as PlaywrightTimeoutError
 
@@ -106,7 +106,7 @@ class Session:
             "- 临时脚本/笔记优先写到 /workspace-ai。\n"
             "- 如用户触发 STOP，工具会停止命令链并给你 system_note；此时请等待用户新指令。\n"
             "\n"
-            f"提示：容器 venv 的 bin 目录通常为 {VENV_BIN}，应优先使用该环境的 python/pip。\n"
+            f"提示：容器 venv 的 bin 目录通常为 {VENV_BIN}，应优先使用该环境的 python/pip。"
         )
 
     @classmethod
@@ -319,13 +319,132 @@ class ChatZAISDKClient(LLMClient):
         self.input_selector = "#chat-input"
         self.assistant_bubble_selector = "#response-content-container"
         
-        # 工具初始化
-        self.md = MarkItDown(enable_plugins=False)
-        
         # Playwright 对象状态管理
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._page: Optional[Page] = None
+
+        self.LANG_PATTERNS = [
+            # 常见：language-python / lang-python / python
+            re.compile(r"^(?:language|lang)[-_](?P<lang>[a-z0-9_+-]+)$", re.I),
+            # 有些站：sourceCode python / highlight-source-python 之类（按需扩展）
+            re.compile(r"^(?P<lang>python|bash|shell|js|javascript|ts|typescript|json|yaml|yml|toml|html|css|sql|cpp|c\+\+|c|java|go|rust)$", re.I),
+        ]
+
+    class TechDocConverter(MarkdownConverter):
+        def convert_pre(self, el, text, parent_tags):
+            # 拿到纯文本代码（忽略内部高亮标签）
+            code = el.get_text()
+
+            # 去掉首尾多余空行（你也可以更激进）
+            code = code.strip("\n")
+
+            lang = None
+            if self.options.get("code_language_callback"):
+                lang = self.options["code_language_callback"](el)
+
+            lang = (lang or self.options.get("code_language") or "").strip()
+            fence = "```"
+
+            # 防御：如果代码里本身包含 ```，就用更长的 fence
+            if "```" in code:
+                fence = "````"
+
+            return f"\n{fence}{lang}\n{code}\n{fence}\n"
+
+    def extract_code_lang(self, pre_el) -> str | None:
+        """
+        给 markdownify 的 code_language_callback 用：
+        - 参数是 <pre> 的 BeautifulSoup Tag
+        - 返回语言字符串（如 'python'），或 None
+        """
+        # 1) 优先从 <pre> 或其内部 <code> 的 class 里找
+        candidates = []
+
+        if pre_el.has_attr("class"):
+            candidates += list(pre_el.get("class", []))
+
+        code = pre_el.find("code")
+        if code and code.has_attr("class"):
+            candidates += list(code.get("class", []))
+
+        for cls in candidates:
+            cls = cls.strip()
+            for pat in self.LANG_PATTERNS:
+                m = pat.match(cls)
+                if m:
+                    lang = m.groupdict().get("lang") or cls
+                    return self.normalize_lang(lang)
+
+            # 处理类似 "brush: python" / "language:python"
+            m = re.search(r"(?:brush|language)\s*[:=]\s*([a-z0-9_+-]+)", cls, re.I)
+            if m:
+                return self.normalize_lang(m.group(1))
+
+        # 2) 一些站点会放 data-language / data-lang
+        for attr in ("data-language", "data-lang"):
+            if pre_el.has_attr(attr):
+                return self.normalize_lang(pre_el[attr])
+
+            if code and code.has_attr(attr):
+                return self.normalize_lang(code[attr])
+
+        return None
+
+
+    def normalize_lang(self, lang: str) -> str:
+        lang = (lang or "").strip().lower()
+        # 常见同义归一化
+        aliases = {
+            "py": "python",
+            "js": "javascript",
+            "shell": "bash",
+            "sh": "bash",
+            "yml": "yaml",
+            "c++": "cpp",
+        }
+        return aliases.get(lang, lang)
+
+
+    def clean_html_for_tech_docs(self, html: str) -> str:
+        """
+        预清洗：
+        - 去掉脚本/样式/导航等
+        - 对代码块内的高亮 <span> 做 unwrap，避免碎片化
+        """
+        soup = BeautifulSoup(html, "lxml")
+
+        # 删噪音（按需增减）
+        for sel in ["script", "style", "noscript", "nav", "footer", "header", "aside"]:
+            for tag in soup.select(sel):
+                tag.decompose()
+
+        # 代码块内：拆掉多余的 span/div，保留纯文本
+        for pre in soup.find_all("pre"):
+            # 常见高亮器会把代码拆成 span
+            for t in pre.find_all(["span", "div"]):
+                t.unwrap()
+
+        return str(soup)
+
+
+    def html_to_markdown(self, html: str) -> str:
+        html = self.clean_html_for_tech_docs(html)
+
+        return self.TechDocConverter(
+            heading_style="ATX",                 # ### 标题更像技术文档
+            bullets="-",                         # 列表风格统一
+            code_language_callback=self.extract_code_lang,
+            # 技术文档里下划线/星号很常见（layer_norm, a*b），避免过度转义影响可读性
+            escape_underscores=False,
+            escape_asterisks=False,
+            # 如果你经常碰到表格没有 thead/th，可以打开
+            table_infer_header=True,
+            # 一般技术博客不需要自动换行重排
+            wrap=False,
+            # 过滤某些标签（可选）
+            strip=["meta", "link"],
+        ).convert(html)
 
     async def _ensure_page_ready(self):
         """
@@ -364,7 +483,7 @@ class ChatZAISDKClient(LLMClient):
             # 如果只有两条，且是 System + User，进行拼接
             system_content = messages[0].get('content', '')
             user_content = messages[1].get('content', '')
-            prompt = f"{system_content}\n提示：记得，你拥有搜索网络的工具：search、open、click、find，合理利用它们。\n提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n用户消息：\n{user_content}"
+            prompt = f"""{system_content}\n\n提示：记得，你拥有搜索网络的工具：search、open、click、find，合理利用它们。\n提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n用户消息：\n{user_content}"""
         else:
             # 否则：提取最后一条 user 消息
             prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
@@ -408,9 +527,7 @@ class ChatZAISDKClient(LLMClient):
         }""")
 
         # 8. 转换为 Markdown
-        # 包装成简单的 HTML 结构以供 markitdown 解析
-        wrapped_html = f"<!doctype html><html><body>{html_content}</body></html>"
-        markdown_text = self.md.convert(io.BytesIO(wrapped_html.encode("utf-8"))).text_content.replace("\\_", "_")
+        markdown_text = self.html_to_markdown(html_content)
         
         return markdown_text
 

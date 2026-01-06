@@ -11,7 +11,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # 装依赖：你后续想切 http client 或换 UI 都方便
 RUN python3 -m pip install -U pip \
-    && python3 -m pip install "openai>=1.0.0" "textual>=0.70.0" "httpx>=0.25.0" "markitdown[all]" "playwright"
+  && python3 -m pip install "openai>=1.0.0" "textual>=0.70.0" "httpx>=0.25.0" "markdownify" "beautifulsoup4" "lxml" "playwright"
 
 # 准备目录（/workspace 由你 run 时映射进来）
 RUN mkdir -p /workspace /workspace-ai
