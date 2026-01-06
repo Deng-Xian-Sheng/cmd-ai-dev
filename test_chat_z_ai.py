@@ -173,7 +173,7 @@ class ChatBot:
             });
 
             // 返回清洗后的文本 (innerText) 或 HTML (innerHTML)
-            return clone.innerHTML;
+            return clone.innerHTML.trim();
         }""")
         
         answer = self.html_to_markdown(answer)
