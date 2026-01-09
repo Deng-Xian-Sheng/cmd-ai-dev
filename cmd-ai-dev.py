@@ -779,6 +779,262 @@ class DeepSeekSDKClient(LLMClient):
         self._playwright = None
         self._page = None        
 
+class LmarenaSDKClient(LLMClient):
+    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", 
+                 url: str = "https://lmarena.ai"):
+        """
+        初始化客户端配置
+        :param cdp_url: 浏览器的 CDP 调试地址
+        :param url: 目标聊天页面 URL
+        """
+        self.cdp_url = cdp_url
+        self.target_url = url
+        
+        # 页面选择器配置
+        self.input_selector = ''
+        self.assistant_bubble_selector = r"div.no-scrollbar.relative.flex.w-full.flex-1.flex-col.overflow-x-auto.transition-\[max-height\].duration-300"
+        
+        # Playwright 对象状态管理
+        self._playwright: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
+        self._page: Optional[Page] = None
+
+        self.LANG_PATTERNS = [
+            # 常见：language-python / lang-python / python
+            re.compile(r"^(?:language|lang)[-_](?P<lang>[a-z0-9_+-]+)$", re.I),
+            # 有些站：sourceCode python / highlight-source-python 之类（按需扩展）
+            re.compile(r"^(?P<lang>python|bash|shell|js|javascript|ts|typescript|json|yaml|yml|toml|html|css|sql|cpp|c\+\+|c|java|go|rust)$", re.I),
+        ]
+
+    class TechDocConverter(MarkdownConverter):
+        def convert_pre(self, el, text, parent_tags):
+            # 拿到纯文本代码（忽略内部高亮标签）
+            code = el.get_text()
+
+            # 去掉首尾多余空行（你也可以更激进）
+            code = code.strip("\n")
+
+            lang = None
+            if self.options.get("code_language_callback"):
+                lang = self.options["code_language_callback"](el)
+
+            lang = (lang or self.options.get("code_language") or "").strip()
+            fence = "`````"
+
+            return f"\n{fence}{lang}\n{code}\n{fence}\n"
+
+    def extract_code_lang(self, pre_el) -> str | None:
+        """
+        给 markdownify 的 code_language_callback 用：
+        - 参数是 <pre> 的 BeautifulSoup Tag
+        - 返回语言字符串（如 'python'），或 None
+        """
+        # 1) 优先从 <pre> 或其内部 <code> 的 class 里找
+        candidates = []
+
+        if pre_el.has_attr("class"):
+            candidates += list(pre_el.get("class", []))
+
+        code = pre_el.find("code")
+        if code and code.has_attr("class"):
+            candidates += list(code.get("class", []))
+
+        for cls in candidates:
+            cls = cls.strip()
+            for pat in self.LANG_PATTERNS:
+                m = pat.match(cls)
+                if m:
+                    lang = m.groupdict().get("lang") or cls
+                    return self.normalize_lang(lang)
+
+            # 处理类似 "brush: python" / "language:python"
+            m = re.search(r"(?:brush|language)\s*[:=]\s*([a-z0-9_+-]+)", cls, re.I)
+            if m:
+                return self.normalize_lang(m.group(1))
+
+        # 2) 一些站点会放 data-language / data-lang
+        for attr in ("data-language", "data-lang"):
+            if pre_el.has_attr(attr):
+                return self.normalize_lang(pre_el[attr])
+
+            if code and code.has_attr(attr):
+                return self.normalize_lang(code[attr])
+
+        return None
+
+
+    def normalize_lang(self, lang: str) -> str:
+        lang = (lang or "").strip().lower()
+        # 常见同义归一化
+        aliases = {
+            "py": "python",
+            "js": "javascript",
+            "shell": "bash",
+            "sh": "bash",
+            "yml": "yaml",
+            "c++": "cpp",
+        }
+        return aliases.get(lang, lang)
+
+
+    def clean_html_for_tech_docs(self, html: str) -> str:
+        """
+        预清洗：
+        - 去掉脚本/样式/导航等
+        - 对代码块内的高亮 <span> 做 unwrap，避免碎片化
+        """
+        soup = BeautifulSoup(html, "lxml")
+
+        # 删噪音（按需增减）
+        for sel in ["script", "style", "noscript", "nav", "footer", "header", "aside"]:
+            for tag in soup.select(sel):
+                tag.decompose()
+
+        # 代码块内：拆掉多余的 span/div，保留纯文本
+        for pre in soup.find_all("pre"):
+            # 常见高亮器会把代码拆成 span
+            for t in pre.find_all(["span", "div"]):
+                t.unwrap()
+
+        return str(soup)
+
+
+    def html_to_markdown(self, html: str) -> str:
+        html = self.clean_html_for_tech_docs(html)
+
+        return self.TechDocConverter(
+            heading_style="ATX",                 # ### 标题更像技术文档
+            bullets="-",                         # 列表风格统一
+            code_language_callback=self.extract_code_lang,
+            # 技术文档里下划线/星号很常见（layer_norm, a*b），避免过度转义影响可读性
+            escape_underscores=False,
+            escape_asterisks=False,
+            # 如果你经常碰到表格没有 thead/th，可以打开
+            table_infer_header=True,
+            # 一般技术博客不需要自动换行重排
+            wrap=False,
+            # 过滤某些标签（可选）
+            strip=["meta", "link"],
+        ).convert(html)
+
+    def remove_markdown_code_blocks(self, text:str):
+        # 正则表达式解释：
+        # ^\s*`````[a-zA-Z]*\n? : 匹配开头可能存在的空白、反引号及语言名
+        # |                     : 或
+        # `````\s*$               : 匹配结尾的反引号及可能的空白
+        pattern = r'^\s*`````[a-zA-Z]*\n?|`````\s*$'
+        
+        # 使用 re.MULTILINE 确保 ^ 和 $ 匹配每一行的开头和结尾
+        # 但由于我们只想处理字符串的最开始和最末尾，通常直接处理即可
+        result = re.sub(pattern, '', text.strip(), flags=re.MULTILINE).strip()
+        return result
+
+    async def _ensure_page_ready(self):
+        """
+        惰性连接浏览器：如果尚未连接或页面关闭，则重新连接
+        """
+        if self._page and not self._page.is_closed():
+            return
+
+        # 启动 Playwright 并连接 CDP
+        self._playwright = await async_playwright().start()
+        try:
+            self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
+            context = self._browser.contexts[0]
+            # 获取第一个页面，如果没有则新建
+            self._page = context.pages[0] if context.pages else await context.new_page()
+
+            # 确保在正确的 URL
+            if not self._page.url.startswith(self.target_url):
+                await self._page.goto(self.target_url)
+                
+        except Exception as e:
+            # 如果连接失败，清理资源
+            await self.close()
+            raise RuntimeError(f"无法连接到浏览器 CDP ({self.cdp_url})。请确保浏览器已通过 --remote-debugging-port=9222 启动。") from e
+
+    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
+        """
+        实现 LLMClient 的标准接口
+        注意：网页版对话通常有上下文记忆，因此这里我们只提取 messages 中的最后一条用户消息发送。
+        """
+        await self._ensure_page_ready()
+        page = self._page
+
+        # 1. 解析输入：处理特殊的 System + User 拼接逻辑
+        if len(messages) == 2 and messages[0].get('role') == 'system' and messages[1].get('role') == 'user':
+            # 如果只有两条，且是 System + User，进行拼接
+            system_content = messages[0].get('content', '')
+            user_content = messages[1].get('content', '')
+            system_content = system_content.replace("- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n", "- **重要！要把 <cmd>...</cmd> 放进 5 个反引号组成的 Markdown 代码块中**（要用 ````` 包裹）。\n")
+            prompt = f"""{system_content}\n\n提示：**重要！不要随便输出<cmd>...</cmd>**，因为只要输出<cmd>...</cmd>，就被视为要执行命令。**重要！输出<cmd>...</cmd>时记得换行**，<cmd>和</cmd>要单独占一行。\n\n用户消息：\n{user_content}"""
+        else:
+            # 否则：提取最后一条 user 消息
+            prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
+
+        if not prompt:
+            raise ValueError("messages 中没有找到有效的 user 消息内容")
+
+        timeout_ms = 1000 * 60 * 5 # 5分钟超时
+
+        if await page.get_by_role("textbox", name="Ask anything…").is_visible():
+            input_box = page.get_by_role("textbox", name="Ask anything…")
+
+        if await page.get_by_role("textbox", name="Ask followup…").is_visible():
+            input_box = page.get_by_role("textbox", name="Ask followup…")
+
+        message_count = await page.locator('button[aria-label="Like this response"]').count()
+
+        # 3. 输入并发送
+        # 确保输入框可见且可操作
+        await input_box.wait_for(state="visible")
+        await input_box.click()
+        await input_box.fill(prompt)
+        
+        if await page.locator('button[type="submit"]').first.is_visible():
+            await page.locator('button[type="submit"]').first.click();
+        elif await page.locator('button[type="submit"]').nth(1).is_visible():
+            await page.locator('button[type="submit"]').nth(1).click();
+        
+        await expect(page.locator('button[aria-label="Like this response"]')).to_have_count(message_count+1, timeout=timeout_ms)
+
+        last = page.locator(self.assistant_bubble_selector).nth(0)
+
+        answer_html = await last.evaluate("""(node) => {
+            // 深拷贝节点，防止影响页面实际显示
+            const clone = node.cloneNode(true);
+            
+            // 定义需要移除的选择器
+            const selectorsToRemove = [
+            ];
+
+            selectorsToRemove.forEach(selector => {
+                const elements = clone.querySelectorAll(selector);
+                elements.forEach(el => el.remove());
+            });
+
+            // 返回清洗后的文本 (innerText) 或 HTML (innerHTML)
+            return clone.innerHTML.trim();
+        }""")
+
+        # 8. 转换为 Markdown
+        markdown_text = self.html_to_markdown(answer_html)
+        
+        markdown_text = self.remove_markdown_code_blocks(markdown_text)
+
+        return markdown_text
+
+    async def close(self):
+        """清理资源"""
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+        self._browser = None
+        self._playwright = None
+        self._page = None        
+
+
 class VDivider(Static):
     def on_mount(self) -> None:
         self.refresh_divider()
@@ -834,9 +1090,11 @@ class CmdAIDevApp(App):
         # OpenAISDKClient API的形式，支持OpenAI API格式的API
         # ChatZAISDKClient https://chat.z.ai 网站的形式
         # DeepSeekSDKClient https://chat.deepseek.com 网站的形式
+        # LmarenaSDKClient https://lmarena.ai 网站的形式
         # self.llm: LLMClient = OpenAISDKClient()
         # self.llm: LLMClient = ChatZAISDKClient()
-        self.llm: LLMClient = DeepSeekSDKClient()
+        # self.llm: LLMClient = DeepSeekSDKClient()
+        self.llm: LLMClient = LmarenaSDKClient()
         self.runner = CommandRunner()
 
         self.busy: bool = False
