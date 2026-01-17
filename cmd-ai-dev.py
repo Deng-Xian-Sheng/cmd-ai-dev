@@ -491,7 +491,7 @@ class ChatZAISDKClient(LLMClient):
         if not prompt:
             raise ValueError("messages 中没有找到有效的 user 消息内容")
 
-        timeout_ms = 1000 * 60 * 5 # 5分钟超时
+        timeout_ms = 1000 * 60 * 10 # 10分钟超时
 
         input_box = page.locator(self.input_selector)
         assistant_bubbles = page.locator(self.assistant_bubble_selector)
@@ -728,7 +728,7 @@ class DeepSeekSDKClient(LLMClient):
         if not prompt:
             raise ValueError("messages 中没有找到有效的 user 消息内容")
 
-        timeout_ms = 1000 * 60 * 5 # 5分钟超时
+        timeout_ms = 1000 * 60 * 10 # 10分钟超时
 
         input_box = page.locator(self.input_selector)
         assistant_bubbles = page.locator(self.assistant_bubble_selector)
@@ -975,7 +975,7 @@ class LmarenaSDKClient(LLMClient):
         if not prompt:
             raise ValueError("messages 中没有找到有效的 user 消息内容")
 
-        timeout_ms = 1000 * 60 * 5 # 5分钟超时
+        timeout_ms = 1000 * 60 * 10 # 10分钟超时
 
         if await page.get_by_role("textbox", name="Ask anything…").is_visible():
             input_box = page.get_by_role("textbox", name="Ask anything…")
@@ -990,7 +990,7 @@ class LmarenaSDKClient(LLMClient):
         await input_box.wait_for(state="visible")
         await input_box.click()
         await input_box.fill(prompt)
-        
+
         if await page.locator('button[type="submit"]').first.is_visible():
             await page.locator('button[type="submit"]').first.click();
         elif await page.locator('button[type="submit"]').nth(1).is_visible():
