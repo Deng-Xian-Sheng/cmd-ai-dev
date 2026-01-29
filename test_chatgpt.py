@@ -142,13 +142,25 @@ class ChatBot:
     async def ask(self, prompt: str, timeout_ms: int = 1000 * 60 * 5) -> str:
         page = self.page
 
-        input_box = page.locator('textarea[name="prompt-textarea"]')
+        input_box  = page.locator('div#prompt-textarea.ProseMirror[contenteditable="true"]')
+        
+        # 等编辑器可用
+        await expect(input_box).to_be_visible()
+        await input_box.click()
 
-        # 2) 填入并回车发送
-        await input_box.fill(prompt, force=True)
-        await page.locator('button#composer-submit-button[data-testid="send-button"]').first.click();
+        # 对 contenteditable 直接 fill
+        await input_box.fill(prompt)
 
-        await expect(page.locator('button#composer-submit-button[data-testid="stop-button"]')).not_to_be_visible(timeout=timeout_ms)
+        send_btn = page.get_by_test_id("send-button")
+        stop_btn = page.get_by_test_id("stop-button")
+
+        # 点发送前确保按钮可用
+        await expect(send_btn).to_be_enabled()
+        await send_btn.click()
+
+        # 关键：先等 stop 出现（确保真的开始生成），再等它消失
+        await expect(stop_btn).to_be_visible(timeout=5000)
+        await expect(stop_btn).to_be_hidden(timeout=timeout_ms)
 
         last = page.locator(self.assistant_bubble_selector).last
         
