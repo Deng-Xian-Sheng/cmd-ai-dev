@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DISPLAY_NUM="${DISPLAY_NUM:-99}"
+DISPLAY=":${DISPLAY_NUM}"
+RESOLUTION="${RESOLUTION:-1920x1080x24}"
+VNC_PORT="${VNC_PORT:-5900}"
+NOVNC_PORT="${NOVNC_PORT:-6080}"
+
+export DISPLAY="$DISPLAY"
+
+mkdir -p /tmp/.X11-unix
+
+if ! pgrep -fa "Xvfb ${DISPLAY}" >/dev/null 2>&1; then
+  echo "[start-gui] starting Xvfb on ${DISPLAY} (${RESOLUTION})"
+  nohup Xvfb "${DISPLAY}" -screen 0 "${RESOLUTION}" -ac -nolisten tcp >/workspace-ai/xvfb.log 2>&1 &
+  sleep 0.2
+fi
+
+if command -v fluxbox >/dev/null 2>&1; then
+  if ! pgrep -fa "fluxbox" >/dev/null 2>&1; then
+    echo "[start-gui] starting fluxbox"
+    nohup fluxbox >/workspace-ai/fluxbox.log 2>&1 &
+    sleep 0.2
+  fi
+fi
+
+if ! pgrep -fa "x11vnc.*${DISPLAY}" >/dev/null 2>&1; then
+  echo "[start-gui] starting x11vnc on port ${VNC_PORT} (no password)"
+  nohup x11vnc -display "${DISPLAY}" -nopw -forever -shared -rfbport "${VNC_PORT}" -xkb >/workspace-ai/x11vnc.log 2>&1 &
+  sleep 0.2
+fi
+
+NOVNC_WEB_DIR=""
+if [ -d /usr/share/novnc ]; then
+  NOVNC_WEB_DIR="/usr/share/novnc"
+elif [ -d /usr/share/noVNC ]; then
+  NOVNC_WEB_DIR="/usr/share/noVNC"
+fi
+
+if ! pgrep -fa "websockify.*${NOVNC_PORT}.*${VNC_PORT}" >/dev/null 2>&1; then
+  echo "[start-gui] starting noVNC(websockify) on http://127.0.0.1:${NOVNC_PORT}/vnc.html"
+  if [ -n "$NOVNC_WEB_DIR" ]; then
+    nohup websockify --web "$NOVNC_WEB_DIR" "${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" >/workspace-ai/novnc.log 2>&1 &
+  else
+    nohup websockify "${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" >/workspace-ai/novnc.log 2>&1 &
+  fi
+  sleep 0.2
+fi
+
+cat <<EOF
+[start-gui] OK
+  DISPLAY=${DISPLAY}
+  VNC:   127.0.0.1:${VNC_PORT}
+  noVNC: http://127.0.0.1:${NOVNC_PORT}/vnc.html
+
+Tips:
+  - If you started the container with --network host, open the noVNC URL on your host browser directly.
+EOF

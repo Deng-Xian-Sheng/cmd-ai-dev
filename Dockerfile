@@ -1,6 +1,5 @@
 FROM docker.cnb.cool/cnb/cool/default-dev-env/dockerfile-caches:ba8c7bf15bfb07dec83820d9a3878fa3134a09a3
 
-# 保险起见：确认 python3/pip 存在（大多数 dev-env 已经有）
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   python3 python3-pip python3-venv python3-dev \
   bash git ca-certificates curl gnupg sudo ffmpeg \
@@ -14,7 +13,22 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
   vim-tiny nano tmux bash-completion \
   openssl \
   locales tzdata \
+  \
+  # browser gui + vnc/novnc + fonts + magic
+  libmagic1 \
+  xvfb x11vnc novnc websockify fluxbox dbus-x11 \
+  fonts-noto-cjk fonts-wqy-zenhei \
   && rm -rf /var/lib/apt/lists/*
+
+# Install Google Chrome stable (amd64)
+RUN set -eux; \
+  wget -qO- https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor > /usr/share/keyrings/google-linux-signing-keyring.gpg; \
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list; \
+  apt-get update; \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends google-chrome-stable; \
+  rm -rf /var/lib/apt/lists/*; \
+  mkdir -p /var/lib/bin/google/chrome; \
+  ln -sf "$(command -v google-chrome-stable)" /var/lib/bin/google/chrome/google-chrome
 
 # venv环境
 RUN python3 -m venv /opt/venv
@@ -44,13 +58,18 @@ RUN python3 -m pip install -U pip setuptools wheel \
   "ruff>=0.1.0" \
   "black>=23.0.0" \
   "mypy>=1.0.0" \
-  "pre-commit>=3.0.0"
+  "pre-commit>=3.0.0" \
+  "python-magic>=0.4.27"
 
 # 准备目录（/workspace 由你 run 时映射进来）
 RUN mkdir -p /workspace /workspace-ai
 
 COPY cmd-ai-dev.py /usr/local/bin/cmd-ai-dev
 RUN chmod +x /usr/local/bin/cmd-ai-dev
+
+COPY look_imgs.py /usr/local/bin/look_imgs
+COPY start-gui /usr/local/bin/start-gui
+RUN chmod +x /usr/local/bin/look_imgs /usr/local/bin/start-gui
 
 ENV WORKSPACE=/workspace
 ENV WORKSPACE_AI=/workspace-ai

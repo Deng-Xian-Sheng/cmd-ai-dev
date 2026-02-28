@@ -28,6 +28,7 @@ docker run -it --rm \
   -e OPENAI_MODEL="你的模型名" \
   -e OPENAI_BASE_URL="你的base_url(可选，OpenAI-compatible 时用)" \
   -v "$PWD:/workspace" \
+  --shm-size=2g \
   cmd-ai-dev:latest
 ```
 
@@ -160,6 +161,7 @@ cmd_ai_dev() {
       -e "OPENAI_MODEL=$OPENAI_MODEL" \
       -e "TERM=${TERM:-xterm-256color}" \
       -v "$proj_dir:/workspace" \
+      --shm-size=2g \
       "$IMAGE_NAME"
   fi
 }

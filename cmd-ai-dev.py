@@ -11,7 +11,7 @@ import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from rich.markdown import Markdown
 from rich.text import Text
@@ -27,12 +27,15 @@ import sys
 
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
+
 os.environ["NODE_NO_WARNINGS"] = "1"
-from playwright.async_api import async_playwright, Page, Playwright, Browser, expect, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Page, Playwright, Browser, expect  # noqa
+
 
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace"))
 WORKSPACE_AI = Path(os.environ.get("WORKSPACE_AI", "/workspace-ai"))
 SESSION_PATH = WORKSPACE_AI / "session.json"
+TRANSCRIPT_PATH = WORKSPACE_AI / "transcript.log"
 
 DEFAULT_TIMEOUT_SEC = 60
 CMDOUT_TRUNCATE_CHARS = 20000
@@ -40,7 +43,12 @@ CMDOUT_TRUNCATE_CHARS = 20000
 VENV_DIR = Path(os.environ.get("VENV_DIR", "/opt/venv"))
 VENV_BIN = VENV_DIR / "bin"
 
-TRANSCRIPT_PATH = WORKSPACE_AI / "transcript.log"
+LOOK_IMGS_JSON_PATH = WORKSPACE_AI / "look_imgs.json"
+
+# ====== message content types (support vision) ======
+ContentPart = Dict[str, Any]
+MessageContent = Union[str, List[ContentPart]]
+Message = Dict[str, Any]
 
 
 def now_ts() -> str:
@@ -71,9 +79,90 @@ def append_transcript(text: str) -> None:
             f.write("\n")
 
 
+def clear_look_imgs_json() -> None:
+    WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(LOOK_IMGS_JSON_PATH, "")
+
+
+def read_look_imgs_json() -> List[Dict[str, Any]]:
+    """读取 look_imgs.json；若为空/不存在/无效则返回 []。"""
+    if not LOOK_IMGS_JSON_PATH.exists():
+        return []
+    raw = LOOK_IMGS_JSON_PATH.read_text(encoding="utf-8", errors="replace").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        mime = str(item.get("mime", "") or "")
+        b64 = str(item.get("b64", "") or "")
+        path = str(item.get("path", "") or "")
+        nbytes = item.get("bytes", None)
+        out.append({"mime": mime, "b64": b64, "path": path, "bytes": nbytes})
+    return out
+
+
+def content_to_text(content: MessageContent) -> str:
+    """用于非视觉模型/网页模型：把 content(list parts) 扁平化为纯文本（忽略图片 base64）。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    chunks: List[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text" and isinstance(part.get("text"), str):
+            chunks.append(part["text"])
+    return "".join(chunks).strip()
+
+
+def last_user_text(messages: List[Message]) -> Optional[str]:
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return content_to_text(m.get("content", ""))
+    return None
+
+
+def build_openai_vision_user_content(text: str, images: List[Dict[str, Any]]) -> List[ContentPart]:
+    """
+    OpenAI Chat Completions 的多模态 content：
+      [{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"data:...;base64,..."}}]
+    """
+    parts: List[ContentPart] = []
+
+    summary_lines: List[str] = []
+    if images:
+        summary_lines.append("\n\n[attached_images]")
+        for i, img in enumerate(images, 1):
+            p = img.get("path", "")
+            mime = img.get("mime", "")
+            nbytes = img.get("bytes", None)
+            extra = f", bytes={nbytes}" if isinstance(nbytes, int) else ""
+            summary_lines.append(f"- {i}. path={p} mime={mime}{extra}")
+
+    text_full = (text or "").rstrip() + ("\n" + "\n".join(summary_lines) if summary_lines else "")
+    parts.append({"type": "text", "text": text_full})
+
+    for img in images:
+        mime = (img.get("mime") or "").strip()
+        b64 = (img.get("b64") or "").strip()
+        if not mime or not b64:
+            continue
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    return parts
+
+
 @dataclass
 class Session:
-    messages: List[Dict[str, Any]]
+    messages: List[Message]
 
     @staticmethod
     def default_system_prompt() -> str:
@@ -101,6 +190,23 @@ class Session:
             "  </cmdout>\n"
             "- 命令输出会同时落盘到 /workspace-ai 供用户复制查看。\n"
             "\n"
+            "视觉（图片输入）工具：\n"
+            "- 你可以让工具执行：look_imgs <img1> <img2> ...  来把图片转为 base64，写入 /workspace-ai/look_imgs.json。\n"
+            "- 警告：look_imgs.json 里是 base64，非常大非常长，不要直接 cat 它。\n"
+            "- 同理：session.json 里也可能包含 base64（图片），也不要直接 cat session.json。\n"
+            "- 若要检查 look_imgs.json，可用：python -c 'import json;print([{\"path\":x.get(\"path\"),\"mime\":x.get(\"mime\"),\"bytes\":x.get(\"bytes\")} for x in json.load(open(\"/workspace-ai/look_imgs.json\"))])'\n"
+            "\n"
+            "操作浏览器（有头 + 宿主机可视化）：\n"
+            "- 容器内提供：Google Chrome + Xvfb + x11vnc + noVNC（无需密码）。\n"
+            "- 建议容器启动时加：--shm-size=2g（避免 Chrome 因 /dev/shm 太小而崩溃）。\n"
+            "- 启动 GUI（虚拟显示器 + noVNC）示例：\n"
+            "  start-gui\n"
+            "  然后让用户在宿主机浏览器打开： http://127.0.0.1:6080/vnc.html\n"
+            "- 启动 Chrome（更像真人，供 Playwright 通过 CDP 连接）示例：\n"
+            "  /var/lib/bin/google/chrome/google-chrome --remote-debugging-port=9222 --user-data-dir=/workspace-ai/cdp-profile --no-first-run --no-default-browser-check\n"
+            "  如果你以 root 运行（少见），需要额外加：--no-sandbox\n"
+            "- 你可以用 python playwright 连接：chromium.connect_over_cdp('http://127.0.0.1:9222') 并操作页面。\n"
+            "\n"
             "建议工作方式：\n"
             "- 每次尽量只请求执行一段命令，收到 <cmdout> 后再决定下一步。\n"
             "- 临时脚本/笔记优先写到 /workspace-ai。\n"
@@ -123,7 +229,7 @@ class Session:
         payload = {"messages": self.messages, "saved_at": time.time()}
         atomic_write_text(SESSION_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
 
-    def add(self, role: str, content: str) -> None:
+    def add(self, role: str, content: MessageContent) -> None:
         self.messages.append({"role": role, "content": content})
         self.save()
 
@@ -194,7 +300,6 @@ class CommandRunner:
     def _build_env(self) -> Dict[str, str]:
         env = dict(os.environ)
 
-        # 强制把 venv/bin 前置到 PATH（防止登录 shell / profile 重置）
         p = env.get("PATH", "")
         venv_bin = str(VENV_BIN)
         if not p.startswith(venv_bin):
@@ -208,7 +313,6 @@ class CommandRunner:
         WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
         log_path = WORKSPACE_AI / f"cmdout_{now_ts()}.log"
 
-        # 输出落盘：避免后台进程继承 PIPE 导致 communicate 卡死
         with log_path.open("wb") as logf:
             self._proc = await asyncio.create_subprocess_exec(
                 "bash",
@@ -269,7 +373,7 @@ class CommandRunner:
 
 
 class LLMClient:
-    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
+    async def stream_chat(self, messages: List[Message]) -> str:
         raise NotImplementedError
 
 
@@ -284,7 +388,7 @@ class OpenAISDKClient(LLMClient):
 
         self.client = OpenAI(api_key=api_key, base_url=base_url)
 
-    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
+    async def stream_chat(self, messages: List[Message]) -> str:
         def _call() -> str:
             acc: List[str] = []
             stream = self.client.chat.completions.create(
@@ -304,63 +408,69 @@ class OpenAISDKClient(LLMClient):
 
         return await asyncio.to_thread(_call)
 
-class ChatZAISDKClient(LLMClient):
-    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", 
-                 url: str = "https://chat.z.ai"):
-        """
-        初始化客户端配置
-        :param cdp_url: 浏览器的 CDP 调试地址
-        :param url: 目标聊天页面 URL
-        """
+
+class PlaywrightMarkdownClientBase(LLMClient):
+    """
+    统一封装：
+    - 通过 CDP 连接已有浏览器
+    - HTML 清洗 + markdownify（带代码语言识别）
+    子类只需要实现：
+    - build_prompt(messages) -> str
+    - chat_once(prompt) -> html(str)
+    - （可选）postprocess_markdown(md) -> str
+    - （可选）custom clean selectors
+    """
+
+    LANG_PATTERNS = [
+        re.compile(r"^(?:language|lang)[-_](?P<lang>[a-z0-9_+-]+)$", re.I),
+        re.compile(
+            r"^(?P<lang>python|bash|shell|js|javascript|ts|typescript|json|yaml|yml|toml|html|css|sql|cpp|c\+\+|c|java|go|rust)$",
+            re.I,
+        ),
+    ]
+
+    def __init__(
+        self,
+        cdp_url: str,
+        url: str,
+        fence_default: str = "```",
+        dynamic_fence: bool = True,
+    ):
         self.cdp_url = cdp_url
         self.target_url = url
-        
-        # 页面选择器配置
-        self.input_selector = "#chat-input"
-        self.assistant_bubble_selector = "#response-content-container"
-        
-        # Playwright 对象状态管理
+
+        self.fence_default = fence_default
+        self.dynamic_fence = dynamic_fence
+
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._page: Optional[Page] = None
 
-        self.LANG_PATTERNS = [
-            # 常见：language-python / lang-python / python
-            re.compile(r"^(?:language|lang)[-_](?P<lang>[a-z0-9_+-]+)$", re.I),
-            # 有些站：sourceCode python / highlight-source-python 之类（按需扩展）
-            re.compile(r"^(?P<lang>python|bash|shell|js|javascript|ts|typescript|json|yaml|yml|toml|html|css|sql|cpp|c\+\+|c|java|go|rust)$", re.I),
-        ]
-
     class TechDocConverter(MarkdownConverter):
         def convert_pre(self, el, text, parent_tags):
-            # 拿到纯文本代码（忽略内部高亮标签）
-            code = el.get_text()
-
-            # 去掉首尾多余空行（你也可以更激进）
-            code = code.strip("\n")
+            code = el.get_text().strip("\n")
 
             lang = None
             if self.options.get("code_language_callback"):
                 lang = self.options["code_language_callback"](el)
-
             lang = (lang or self.options.get("code_language") or "").strip()
-            fence = "```"
 
-            # 防御：如果代码里本身包含 ```，就用更长的 fence
-            if "```" in code:
-                fence = "````"
+            fence = str(self.options.get("fence_default") or "```")
+            dynamic = bool(self.options.get("dynamic_fence", True))
+            if dynamic:
+                # 防御：如果代码里包含 fence，就延长 fence
+                while fence in code:
+                    fence += "`"
 
             return f"\n{fence}{lang}\n{code}\n{fence}\n"
 
-    def extract_code_lang(self, pre_el) -> str | None:
-        """
-        给 markdownify 的 code_language_callback 用：
-        - 参数是 <pre> 的 BeautifulSoup Tag
-        - 返回语言字符串（如 'python'），或 None
-        """
-        # 1) 优先从 <pre> 或其内部 <code> 的 class 里找
-        candidates = []
+    def normalize_lang(self, lang: str) -> str:
+        lang = (lang or "").strip().lower()
+        aliases = {"py": "python", "js": "javascript", "shell": "bash", "sh": "bash", "yml": "yaml", "c++": "cpp"}
+        return aliases.get(lang, lang)
 
+    def extract_code_lang(self, pre_el) -> str | None:
+        candidates: List[str] = []
         if pre_el.has_attr("class"):
             candidates += list(pre_el.get("class", []))
 
@@ -376,910 +486,62 @@ class ChatZAISDKClient(LLMClient):
                     lang = m.groupdict().get("lang") or cls
                     return self.normalize_lang(lang)
 
-            # 处理类似 "brush: python" / "language:python"
             m = re.search(r"(?:brush|language)\s*[:=]\s*([a-z0-9_+-]+)", cls, re.I)
             if m:
                 return self.normalize_lang(m.group(1))
 
-        # 2) 一些站点会放 data-language / data-lang
         for attr in ("data-language", "data-lang"):
             if pre_el.has_attr(attr):
                 return self.normalize_lang(pre_el[attr])
-
             if code and code.has_attr(attr):
                 return self.normalize_lang(code[attr])
 
         return None
 
-
-    def normalize_lang(self, lang: str) -> str:
-        lang = (lang or "").strip().lower()
-        # 常见同义归一化
-        aliases = {
-            "py": "python",
-            "js": "javascript",
-            "shell": "bash",
-            "sh": "bash",
-            "yml": "yaml",
-            "c++": "cpp",
-        }
-        return aliases.get(lang, lang)
-
-
     def clean_html_for_tech_docs(self, html: str) -> str:
-        """
-        预清洗：
-        - 去掉脚本/样式/导航等
-        - 对代码块内的高亮 <span> 做 unwrap，避免碎片化
-        """
         soup = BeautifulSoup(html, "lxml")
 
-        # 删噪音（按需增减）
         for sel in ["script", "style", "noscript", "nav", "footer", "header", "aside"]:
             for tag in soup.select(sel):
                 tag.decompose()
 
-        # 代码块内：拆掉多余的 span/div，保留纯文本
         for pre in soup.find_all("pre"):
-            # 常见高亮器会把代码拆成 span
             for t in pre.find_all(["span", "div"]):
                 t.unwrap()
 
         return str(soup)
 
-
     def html_to_markdown(self, html: str) -> str:
         html = self.clean_html_for_tech_docs(html)
-
         return self.TechDocConverter(
-            heading_style="ATX",                 # ### 标题更像技术文档
-            bullets="-",                         # 列表风格统一
+            heading_style="ATX",
+            bullets="-",
             code_language_callback=self.extract_code_lang,
-            # 技术文档里下划线/星号很常见（layer_norm, a*b），避免过度转义影响可读性
             escape_underscores=False,
             escape_asterisks=False,
-            # 如果你经常碰到表格没有 thead/th，可以打开
             table_infer_header=True,
-            # 一般技术博客不需要自动换行重排
             wrap=False,
-            # 过滤某些标签（可选）
             strip=["meta", "link"],
+            fence_default=self.fence_default,
+            dynamic_fence=self.dynamic_fence,
         ).convert(html)
 
     async def _ensure_page_ready(self):
-        """
-        惰性连接浏览器：如果尚未连接或页面关闭，则重新连接
-        """
         if self._page and not self._page.is_closed():
             return
 
-        # 启动 Playwright 并连接 CDP
         self._playwright = await async_playwright().start()
         try:
             self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
             context = self._browser.contexts[0]
-            # 获取第一个页面，如果没有则新建
             self._page = context.pages[0] if context.pages else await context.new_page()
-
-            # 确保在正确的 URL
             if not self._page.url.startswith(self.target_url):
                 await self._page.goto(self.target_url)
-                
         except Exception as e:
-            # 如果连接失败，清理资源
             await self.close()
             raise RuntimeError(f"无法连接到浏览器 CDP ({self.cdp_url})。请确保浏览器已通过 --remote-debugging-port=9222 启动。") from e
 
-    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
-        """
-        实现 LLMClient 的标准接口
-        注意：网页版对话通常有上下文记忆，因此这里我们只提取 messages 中的最后一条用户消息发送。
-        """
-        await self._ensure_page_ready()
-        page = self._page
-
-        # 1. 解析输入：处理特殊的 System + User 拼接逻辑
-        if len(messages) == 2 and messages[0].get('role') == 'system' and messages[1].get('role') == 'user':
-            # 如果只有两条，且是 System + User，进行拼接
-            system_content = messages[0].get('content', '')
-            user_content = messages[1].get('content', '')
-            prompt = f"""{system_content}\n\n提示：记得，你拥有搜索网络的工具：search、open、click、find，合理利用它们。\n提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n用户消息：\n{user_content}"""
-        else:
-            # 否则：提取最后一条 user 消息
-            prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
-
-        if not prompt:
-            raise ValueError("messages 中没有找到有效的 user 消息内容")
-
-        timeout_ms = 1000 * 60 * 10 # 10分钟超时
-
-        input_box = page.locator(self.input_selector)
-        assistant_bubbles = page.locator(self.assistant_bubble_selector)
-
-        # 3. 输入并发送
-        # 确保输入框可见且可操作
-        await input_box.wait_for(state="visible")
-        await input_box.click()
-        await input_box.fill(prompt)
-        await page.locator("#send-message-button").click()
-
-        await page.locator('#send-message-button').wait_for(state="attached", timeout=timeout_ms)
-
-        last_bubble = assistant_bubbles.nth(-1)
-
-        # 7. 清洗 HTML (去除思考过程)
-        html_content = await last_bubble.locator("> div").first.evaluate("""(node) => {
-            const clone = node.cloneNode(true);
-            
-            const selectorsToRemove = [
-                '.thinking-chain-container', 
-                '.thinking-block',
-                '.w-full.overflow-hidden.h-0', 
-                '.cursor-default'
-            ];
-
-            selectorsToRemove.forEach(selector => {
-                const elements = clone.querySelectorAll(selector);
-                elements.forEach(el => el.remove());
-            });
-
-            return clone.innerHTML.trim();
-        }""")
-
-        # 8. 转换为 Markdown
-        markdown_text = self.html_to_markdown(html_content)
-        
-        return markdown_text
-
     async def close(self):
-        """清理资源"""
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-        self._browser = None
-        self._playwright = None
-        self._page = None        
-
-class DeepSeekSDKClient(LLMClient):
-    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", 
-                 url: str = "https://chat.deepseek.com"):
-        """
-        初始化客户端配置
-        :param cdp_url: 浏览器的 CDP 调试地址
-        :param url: 目标聊天页面 URL
-        """
-        self.cdp_url = cdp_url
-        self.target_url = url
-        
-        # 页面选择器配置
-        self.input_selector = 'textarea[placeholder="给 DeepSeek 发送消息 "]'
-        self.assistant_bubble_selector = "div.ds-markdown"
-        
-        # Playwright 对象状态管理
-        self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self._page: Optional[Page] = None
-
-        self.LANG_PATTERNS = [
-            # 常见：language-python / lang-python / python
-            re.compile(r"^(?:language|lang)[-_](?P<lang>[a-z0-9_+-]+)$", re.I),
-            # 有些站：sourceCode python / highlight-source-python 之类（按需扩展）
-            re.compile(r"^(?P<lang>python|bash|shell|js|javascript|ts|typescript|json|yaml|yml|toml|html|css|sql|cpp|c\+\+|c|java|go|rust)$", re.I),
-        ]
-
-    class TechDocConverter(MarkdownConverter):
-        def convert_pre(self, el, text, parent_tags):
-            # 拿到纯文本代码（忽略内部高亮标签）
-            code = el.get_text()
-
-            # 去掉首尾多余空行（你也可以更激进）
-            code = code.strip("\n")
-
-            lang = None
-            if self.options.get("code_language_callback"):
-                lang = self.options["code_language_callback"](el)
-
-            lang = (lang or self.options.get("code_language") or "").strip()
-            fence = "```"
-
-            # 防御：如果代码里本身包含 ```，就用更长的 fence
-            if "```" in code:
-                fence = "````"
-
-            return f"\n{fence}{lang}\n{code}\n{fence}\n"
-
-    def extract_code_lang(self, pre_el) -> str | None:
-        """
-        给 markdownify 的 code_language_callback 用：
-        - 参数是 <pre> 的 BeautifulSoup Tag
-        - 返回语言字符串（如 'python'），或 None
-        """
-        # 1) 优先从 <pre> 或其内部 <code> 的 class 里找
-        candidates = []
-
-        if pre_el.has_attr("class"):
-            candidates += list(pre_el.get("class", []))
-
-        code = pre_el.find("code")
-        if code and code.has_attr("class"):
-            candidates += list(code.get("class", []))
-
-        for cls in candidates:
-            cls = cls.strip()
-            for pat in self.LANG_PATTERNS:
-                m = pat.match(cls)
-                if m:
-                    lang = m.groupdict().get("lang") or cls
-                    return self.normalize_lang(lang)
-
-            # 处理类似 "brush: python" / "language:python"
-            m = re.search(r"(?:brush|language)\s*[:=]\s*([a-z0-9_+-]+)", cls, re.I)
-            if m:
-                return self.normalize_lang(m.group(1))
-
-        # 2) 一些站点会放 data-language / data-lang
-        for attr in ("data-language", "data-lang"):
-            if pre_el.has_attr(attr):
-                return self.normalize_lang(pre_el[attr])
-
-            if code and code.has_attr(attr):
-                return self.normalize_lang(code[attr])
-
-        return None
-
-
-    def normalize_lang(self, lang: str) -> str:
-        lang = (lang or "").strip().lower()
-        # 常见同义归一化
-        aliases = {
-            "py": "python",
-            "js": "javascript",
-            "shell": "bash",
-            "sh": "bash",
-            "yml": "yaml",
-            "c++": "cpp",
-        }
-        return aliases.get(lang, lang)
-
-
-    def clean_html_for_tech_docs(self, html: str) -> str:
-        """
-        预清洗：
-        - 去掉脚本/样式/导航等
-        - 对代码块内的高亮 <span> 做 unwrap，避免碎片化
-        """
-        soup = BeautifulSoup(html, "lxml")
-
-        # 删噪音（按需增减）
-        for sel in ["script", "style", "noscript", "nav", "footer", "header", "aside"]:
-            for tag in soup.select(sel):
-                tag.decompose()
-
-        # 代码块内：拆掉多余的 span/div，保留纯文本
-        for pre in soup.find_all("pre"):
-            # 常见高亮器会把代码拆成 span
-            for t in pre.find_all(["span", "div"]):
-                t.unwrap()
-
-        return str(soup)
-
-
-    def html_to_markdown(self, html: str) -> str:
-        html = self.clean_html_for_tech_docs(html)
-
-        return self.TechDocConverter(
-            heading_style="ATX",                 # ### 标题更像技术文档
-            bullets="-",                         # 列表风格统一
-            code_language_callback=self.extract_code_lang,
-            # 技术文档里下划线/星号很常见（layer_norm, a*b），避免过度转义影响可读性
-            escape_underscores=False,
-            escape_asterisks=False,
-            # 如果你经常碰到表格没有 thead/th，可以打开
-            table_infer_header=True,
-            # 一般技术博客不需要自动换行重排
-            wrap=False,
-            # 过滤某些标签（可选）
-            strip=["meta", "link"],
-        ).convert(html)
-
-    async def _ensure_page_ready(self):
-        """
-        惰性连接浏览器：如果尚未连接或页面关闭，则重新连接
-        """
-        if self._page and not self._page.is_closed():
-            return
-
-        # 启动 Playwright 并连接 CDP
-        self._playwright = await async_playwright().start()
-        try:
-            self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
-            context = self._browser.contexts[0]
-            # 获取第一个页面，如果没有则新建
-            self._page = context.pages[0] if context.pages else await context.new_page()
-
-            # 确保在正确的 URL
-            if not self._page.url.startswith(self.target_url):
-                await self._page.goto(self.target_url)
-                
-        except Exception as e:
-            # 如果连接失败，清理资源
-            await self.close()
-            raise RuntimeError(f"无法连接到浏览器 CDP ({self.cdp_url})。请确保浏览器已通过 --remote-debugging-port=9222 启动。") from e
-
-    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
-        """
-        实现 LLMClient 的标准接口
-        注意：网页版对话通常有上下文记忆，因此这里我们只提取 messages 中的最后一条用户消息发送。
-        """
-        await self._ensure_page_ready()
-        page = self._page
-
-        # 1. 解析输入：处理特殊的 System + User 拼接逻辑
-        if len(messages) == 2 and messages[0].get('role') == 'system' and messages[1].get('role') == 'user':
-            # 如果只有两条，且是 System + User，进行拼接
-            system_content = messages[0].get('content', '')
-            user_content = messages[1].get('content', '')
-            prompt = f"""{system_content}\n\n提示：**重要！不要随便输出<cmd>...</cmd>**，因为只要输出<cmd>...</cmd>，就被视为要执行命令。**重要！输出<cmd>...</cmd>时记得换行**，<cmd>和</cmd>要单独占一行。\n提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n用户消息：\n{user_content}"""
-        else:
-            # 否则：提取最后一条 user 消息
-            prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
-
-        if not prompt:
-            raise ValueError("messages 中没有找到有效的 user 消息内容")
-
-        timeout_ms = 1000 * 60 * 10 # 10分钟超时
-
-        input_box = page.locator(self.input_selector)
-        assistant_bubbles = page.locator(self.assistant_bubble_selector)
-
-        # 3. 输入并发送
-        # 确保输入框可见且可操作
-        await input_box.wait_for(state="visible")
-        await input_box.click()
-        await input_box.fill(prompt)
-        await page.locator('path[d="M8.3125 0.981587C8.66767 1.0545 8.97902 1.20558 9.2627 1.43374C9.48724 1.61438 9.73029 1.85933 9.97949 2.10854L14.707 6.83608L13.293 8.25014L9 3.95717V15.0431H7V3.95717L2.70703 8.25014L1.29297 6.83608L6.02051 2.10854C6.26971 1.85933 6.51277 1.61438 6.7373 1.43374C6.97662 1.24126 7.28445 1.04542 7.6875 0.981587C7.8973 0.94841 8.1031 0.956564 8.3125 0.981587Z"]').click()
-
-        await expect(page.locator('path[d="M8.3125 0.981587C8.66767 1.0545 8.97902 1.20558 9.2627 1.43374C9.48724 1.61438 9.73029 1.85933 9.97949 2.10854L14.707 6.83608L13.293 8.25014L9 3.95717V15.0431H7V3.95717L2.70703 8.25014L1.29297 6.83608L6.02051 2.10854C6.26971 1.85933 6.51277 1.61438 6.7373 1.43374C6.97662 1.24126 7.28445 1.04542 7.6875 0.981587C7.8973 0.94841 8.1031 0.956564 8.3125 0.981587Z"]')).to_be_visible(timeout=timeout_ms)
-        asyncio.sleep(1)
-        await expect(page.locator('path[d="M8.3125 0.981587C8.66767 1.0545 8.97902 1.20558 9.2627 1.43374C9.48724 1.61438 9.73029 1.85933 9.97949 2.10854L14.707 6.83608L13.293 8.25014L9 3.95717V15.0431H7V3.95717L2.70703 8.25014L1.29297 6.83608L6.02051 2.10854C6.26971 1.85933 6.51277 1.61438 6.7373 1.43374C6.97662 1.24126 7.28445 1.04542 7.6875 0.981587C7.8973 0.94841 8.1031 0.956564 8.3125 0.981587Z"]')).to_be_visible(timeout=timeout_ms)
-
-        last = assistant_bubbles.nth(-1)
-
-        answer_html = await last.evaluate("""(node) => {
-            // 深拷贝节点，防止影响页面实际显示
-            const clone = node.cloneNode(true);
-            
-            // 定义需要移除的选择器
-            const selectorsToRemove = [
-                '.md-code-block-banner-wrap'
-            ];
-
-            selectorsToRemove.forEach(selector => {
-                const elements = clone.querySelectorAll(selector);
-                elements.forEach(el => el.remove());
-            });
-
-            // 返回清洗后的文本 (innerText) 或 HTML (innerHTML)
-            return clone.innerHTML.trim();
-        }""")
-
-        # 8. 转换为 Markdown
-        markdown_text = self.html_to_markdown(answer_html)
-        
-        return markdown_text
-
-    async def close(self):
-        """清理资源"""
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-        self._browser = None
-        self._playwright = None
-        self._page = None        
-
-class LmarenaSDKClient(LLMClient):
-    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", 
-                 url: str = "https://lmarena.ai"):
-        """
-        初始化客户端配置
-        :param cdp_url: 浏览器的 CDP 调试地址
-        :param url: 目标聊天页面 URL
-        """
-        self.cdp_url = cdp_url
-        self.target_url = url
-        
-        # 页面选择器配置
-        self.input_selector = ''
-        self.assistant_bubble_selector = r"div.no-scrollbar.relative.flex.w-full.flex-1.flex-col.overflow-x-auto.transition-\[max-height\].duration-300"
-        
-        # Playwright 对象状态管理
-        self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self._page: Optional[Page] = None
-
-        self.LANG_PATTERNS = [
-            # 常见：language-python / lang-python / python
-            re.compile(r"^(?:language|lang)[-_](?P<lang>[a-z0-9_+-]+)$", re.I),
-            # 有些站：sourceCode python / highlight-source-python 之类（按需扩展）
-            re.compile(r"^(?P<lang>python|bash|shell|js|javascript|ts|typescript|json|yaml|yml|toml|html|css|sql|cpp|c\+\+|c|java|go|rust)$", re.I),
-        ]
-
-    class TechDocConverter(MarkdownConverter):
-        def convert_pre(self, el, text, parent_tags):
-            # 拿到纯文本代码（忽略内部高亮标签）
-            code = el.get_text()
-
-            # 去掉首尾多余空行（你也可以更激进）
-            code = code.strip("\n")
-
-            lang = None
-            if self.options.get("code_language_callback"):
-                lang = self.options["code_language_callback"](el)
-
-            lang = (lang or self.options.get("code_language") or "").strip()
-            fence = "`````"
-
-            return f"\n{fence}{lang}\n{code}\n{fence}\n"
-
-    def extract_code_lang(self, pre_el) -> str | None:
-        """
-        给 markdownify 的 code_language_callback 用：
-        - 参数是 <pre> 的 BeautifulSoup Tag
-        - 返回语言字符串（如 'python'），或 None
-        """
-        # 1) 优先从 <pre> 或其内部 <code> 的 class 里找
-        candidates = []
-
-        if pre_el.has_attr("class"):
-            candidates += list(pre_el.get("class", []))
-
-        code = pre_el.find("code")
-        if code and code.has_attr("class"):
-            candidates += list(code.get("class", []))
-
-        for cls in candidates:
-            cls = cls.strip()
-            for pat in self.LANG_PATTERNS:
-                m = pat.match(cls)
-                if m:
-                    lang = m.groupdict().get("lang") or cls
-                    return self.normalize_lang(lang)
-
-            # 处理类似 "brush: python" / "language:python"
-            m = re.search(r"(?:brush|language)\s*[:=]\s*([a-z0-9_+-]+)", cls, re.I)
-            if m:
-                return self.normalize_lang(m.group(1))
-
-        # 2) 一些站点会放 data-language / data-lang
-        for attr in ("data-language", "data-lang"):
-            if pre_el.has_attr(attr):
-                return self.normalize_lang(pre_el[attr])
-
-            if code and code.has_attr(attr):
-                return self.normalize_lang(code[attr])
-
-        return None
-
-
-    def normalize_lang(self, lang: str) -> str:
-        lang = (lang or "").strip().lower()
-        # 常见同义归一化
-        aliases = {
-            "py": "python",
-            "js": "javascript",
-            "shell": "bash",
-            "sh": "bash",
-            "yml": "yaml",
-            "c++": "cpp",
-        }
-        return aliases.get(lang, lang)
-
-
-    def clean_html_for_tech_docs(self, html: str) -> str:
-        """
-        预清洗：
-        - 去掉脚本/样式/导航等
-        - 对代码块内的高亮 <span> 做 unwrap，避免碎片化
-        """
-        soup = BeautifulSoup(html, "lxml")
-
-        # 删噪音（按需增减）
-        for sel in ["script", "style", "noscript", "nav", "footer", "header", "aside"]:
-            for tag in soup.select(sel):
-                tag.decompose()
-
-        # 代码块内：拆掉多余的 span/div，保留纯文本
-        for pre in soup.find_all("pre"):
-            # 常见高亮器会把代码拆成 span
-            for t in pre.find_all(["span", "div"]):
-                t.unwrap()
-
-        return str(soup)
-
-
-    def html_to_markdown(self, html: str) -> str:
-        html = self.clean_html_for_tech_docs(html)
-
-        return self.TechDocConverter(
-            heading_style="ATX",                 # ### 标题更像技术文档
-            bullets="-",                         # 列表风格统一
-            code_language_callback=self.extract_code_lang,
-            # 技术文档里下划线/星号很常见（layer_norm, a*b），避免过度转义影响可读性
-            escape_underscores=False,
-            escape_asterisks=False,
-            # 如果你经常碰到表格没有 thead/th，可以打开
-            table_infer_header=True,
-            # 一般技术博客不需要自动换行重排
-            wrap=False,
-            # 过滤某些标签（可选）
-            strip=["meta", "link"],
-        ).convert(html)
-
-    def remove_markdown_code_blocks(self, text:str):
-        # 正则表达式解释：
-        # ^\s*`````[a-zA-Z]*\n? : 匹配开头可能存在的空白、反引号及语言名
-        # |                     : 或
-        # `````\s*$               : 匹配结尾的反引号及可能的空白
-        pattern = r'^\s*`````[a-zA-Z]*\n?|`````\s*$'
-        
-        # 使用 re.MULTILINE 确保 ^ 和 $ 匹配每一行的开头和结尾
-        # 但由于我们只想处理字符串的最开始和最末尾，通常直接处理即可
-        result = re.sub(pattern, '', text.strip(), flags=re.MULTILINE).strip()
-        return result
-
-    async def _ensure_page_ready(self):
-        """
-        惰性连接浏览器：如果尚未连接或页面关闭，则重新连接
-        """
-        if self._page and not self._page.is_closed():
-            return
-
-        # 启动 Playwright 并连接 CDP
-        self._playwright = await async_playwright().start()
-        try:
-            self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
-            context = self._browser.contexts[0]
-            # 获取第一个页面，如果没有则新建
-            self._page = context.pages[0] if context.pages else await context.new_page()
-
-            # 确保在正确的 URL
-            if not self._page.url.startswith(self.target_url):
-                await self._page.goto(self.target_url)
-                
-        except Exception as e:
-            # 如果连接失败，清理资源
-            await self.close()
-            raise RuntimeError(f"无法连接到浏览器 CDP ({self.cdp_url})。请确保浏览器已通过 --remote-debugging-port=9222 启动。") from e
-
-    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
-        """
-        实现 LLMClient 的标准接口
-        注意：网页版对话通常有上下文记忆，因此这里我们只提取 messages 中的最后一条用户消息发送。
-        """
-        await self._ensure_page_ready()
-        page = self._page
-
-        # 1. 解析输入：处理特殊的 System + User 拼接逻辑
-        if len(messages) == 2 and messages[0].get('role') == 'system' and messages[1].get('role') == 'user':
-            # 如果只有两条，且是 System + User，进行拼接
-            system_content = messages[0].get('content', '')
-            user_content = messages[1].get('content', '')
-            system_content = system_content.replace("- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n", "- **重要！要把 <cmd>...</cmd> 放进 5 个反引号组成的 Markdown 代码块中**（要用 ````` 包裹）。\n")
-            prompt = f"""{system_content}\n\n提示：**重要！不要随便输出<cmd>...</cmd>**，因为只要输出<cmd>...</cmd>，就被视为要执行命令。**重要！输出<cmd>...</cmd>时记得换行**，<cmd>和</cmd>要单独占一行。\n\n用户消息：\n{user_content}"""
-        else:
-            # 否则：提取最后一条 user 消息
-            prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
-
-        if not prompt:
-            raise ValueError("messages 中没有找到有效的 user 消息内容")
-
-        timeout_ms = 1000 * 60 * 10 # 10分钟超时
-
-        if await page.get_by_role("textbox", name="Ask anything…").is_visible():
-            input_box = page.get_by_role("textbox", name="Ask anything…")
-
-        if await page.get_by_role("textbox", name="Ask followup…").is_visible():
-            input_box = page.get_by_role("textbox", name="Ask followup…")
-
-        message_count = await page.locator('button[aria-label="Like this response"]').count()
-
-        # 3. 输入并发送
-        # 确保输入框可见且可操作
-        await input_box.wait_for(state="visible")
-        await input_box.click()
-        await input_box.fill(prompt)
-
-        if await page.locator('button[type="submit"]').first.is_visible():
-            await page.locator('button[type="submit"]').first.click();
-        elif await page.locator('button[type="submit"]').nth(1).is_visible():
-            await page.locator('button[type="submit"]').nth(1).click();
-        
-        await expect(page.locator('button[aria-label="Like this response"]')).to_have_count(message_count+1, timeout=timeout_ms)
-
-        last = page.locator(self.assistant_bubble_selector).nth(0)
-
-        answer_html = await last.evaluate("""(node) => {
-            // 深拷贝节点，防止影响页面实际显示
-            const clone = node.cloneNode(true);
-            
-            // 定义需要移除的选择器
-            const selectorsToRemove = [
-            ];
-
-            selectorsToRemove.forEach(selector => {
-                const elements = clone.querySelectorAll(selector);
-                elements.forEach(el => el.remove());
-            });
-
-            // 返回清洗后的文本 (innerText) 或 HTML (innerHTML)
-            return clone.innerHTML.trim();
-        }""")
-
-        # 8. 转换为 Markdown
-        markdown_text = self.html_to_markdown(answer_html)
-        
-        markdown_text = self.remove_markdown_code_blocks(markdown_text)
-
-        return markdown_text
-
-    async def close(self):
-        """清理资源"""
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-        self._browser = None
-        self._playwright = None
-        self._page = None        
-
-class ChatGPTSDKClient(LLMClient):
-    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", 
-                 url: str = "https://chatgpt.com"):
-        """
-        初始化客户端配置
-        :param cdp_url: 浏览器的 CDP 调试地址
-        :param url: 目标聊天页面 URL
-        """
-        self.cdp_url = cdp_url
-        self.target_url = url
-        
-        # 页面选择器配置
-        self.input_selector = ''
-        self.assistant_bubble_selector = r'div[data-message-author-role="assistant"]'
-        
-        # Playwright 对象状态管理
-        self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self._page: Optional[Page] = None
-
-        self.LANG_PATTERNS = [
-            # 常见：language-python / lang-python / python
-            re.compile(r"^(?:language|lang)[-_](?P<lang>[a-z0-9_+-]+)$", re.I),
-            # 有些站：sourceCode python / highlight-source-python 之类（按需扩展）
-            re.compile(r"^(?P<lang>python|bash|shell|js|javascript|ts|typescript|json|yaml|yml|toml|html|css|sql|cpp|c\+\+|c|java|go|rust)$", re.I),
-        ]
-
-    class TechDocConverter(MarkdownConverter):
-        def convert_pre(self, el, text, parent_tags):
-            # 拿到纯文本代码（忽略内部高亮标签）
-            code = el.get_text()
-
-            # 去掉首尾多余空行（你也可以更激进）
-            code = code.strip("\n")
-
-            lang = None
-            if self.options.get("code_language_callback"):
-                lang = self.options["code_language_callback"](el)
-
-            lang = (lang or self.options.get("code_language") or "").strip()
-            fence = "`````"
-
-            return f"\n{fence}{lang}\n{code}\n{fence}\n"
-
-    def extract_code_lang(self, pre_el) -> str | None:
-        """
-        给 markdownify 的 code_language_callback 用：
-        - 参数是 <pre> 的 BeautifulSoup Tag
-        - 返回语言字符串（如 'python'），或 None
-        """
-        # 1) 优先从 <pre> 或其内部 <code> 的 class 里找
-        candidates = []
-
-        if pre_el.has_attr("class"):
-            candidates += list(pre_el.get("class", []))
-
-        code = pre_el.find("code")
-        if code and code.has_attr("class"):
-            candidates += list(code.get("class", []))
-
-        for cls in candidates:
-            cls = cls.strip()
-            for pat in self.LANG_PATTERNS:
-                m = pat.match(cls)
-                if m:
-                    lang = m.groupdict().get("lang") or cls
-                    return self.normalize_lang(lang)
-
-            # 处理类似 "brush: python" / "language:python"
-            m = re.search(r"(?:brush|language)\s*[:=]\s*([a-z0-9_+-]+)", cls, re.I)
-            if m:
-                return self.normalize_lang(m.group(1))
-
-        # 2) 一些站点会放 data-language / data-lang
-        for attr in ("data-language", "data-lang"):
-            if pre_el.has_attr(attr):
-                return self.normalize_lang(pre_el[attr])
-
-            if code and code.has_attr(attr):
-                return self.normalize_lang(code[attr])
-
-        return None
-
-
-    def normalize_lang(self, lang: str) -> str:
-        lang = (lang or "").strip().lower()
-        # 常见同义归一化
-        aliases = {
-            "py": "python",
-            "js": "javascript",
-            "shell": "bash",
-            "sh": "bash",
-            "yml": "yaml",
-            "c++": "cpp",
-        }
-        return aliases.get(lang, lang)
-
-
-    def clean_html_for_tech_docs(self, html: str) -> str:
-        """
-        预清洗：
-        - 去掉脚本/样式/导航等
-        - 对代码块内的高亮 <span> 做 unwrap，避免碎片化
-        """
-        soup = BeautifulSoup(html, "lxml")
-
-        # 删噪音（按需增减）
-        for sel in ["script", "style", "noscript", "nav", "footer", "header", "aside"]:
-            for tag in soup.select(sel):
-                tag.decompose()
-
-        # 代码块内：拆掉多余的 span/div，保留纯文本
-        for pre in soup.find_all("pre"):
-            # 常见高亮器会把代码拆成 span
-            for t in pre.find_all(["span", "div"]):
-                t.unwrap()
-
-        return str(soup)
-
-
-    def html_to_markdown(self, html: str) -> str:
-        html = self.clean_html_for_tech_docs(html)
-
-        return self.TechDocConverter(
-            heading_style="ATX",                 # ### 标题更像技术文档
-            bullets="-",                         # 列表风格统一
-            code_language_callback=self.extract_code_lang,
-            # 技术文档里下划线/星号很常见（layer_norm, a*b），避免过度转义影响可读性
-            escape_underscores=False,
-            escape_asterisks=False,
-            # 如果你经常碰到表格没有 thead/th，可以打开
-            table_infer_header=True,
-            # 一般技术博客不需要自动换行重排
-            wrap=False,
-            # 过滤某些标签（可选）
-            strip=["meta", "link"],
-        ).convert(html)
-
-    def remove_markdown_code_blocks(self, text:str):
-        # 正则表达式解释：
-        # ^\s*`````[a-zA-Z]*\n? : 匹配开头可能存在的空白、反引号及语言名
-        # |                     : 或
-        # `````\s*$               : 匹配结尾的反引号及可能的空白
-        pattern = r'^\s*`````[a-zA-Z]*\n?|`````\s*$'
-        
-        # 使用 re.MULTILINE 确保 ^ 和 $ 匹配每一行的开头和结尾
-        # 但由于我们只想处理字符串的最开始和最末尾，通常直接处理即可
-        result = re.sub(pattern, '', text.strip(), flags=re.MULTILINE).strip()
-        return result
-
-    async def _ensure_page_ready(self):
-        """
-        惰性连接浏览器：如果尚未连接或页面关闭，则重新连接
-        """
-        if self._page and not self._page.is_closed():
-            return
-
-        # 启动 Playwright 并连接 CDP
-        self._playwright = await async_playwright().start()
-        try:
-            self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
-            context = self._browser.contexts[0]
-            # 获取第一个页面，如果没有则新建
-            self._page = context.pages[0] if context.pages else await context.new_page()
-
-            # 确保在正确的 URL
-            if not self._page.url.startswith(self.target_url):
-                await self._page.goto(self.target_url)
-                
-        except Exception as e:
-            # 如果连接失败，清理资源
-            await self.close()
-            raise RuntimeError(f"无法连接到浏览器 CDP ({self.cdp_url})。请确保浏览器已通过 --remote-debugging-port=9222 启动。") from e
-
-    async def stream_chat(self, messages: List[Dict[str, Any]]) -> str:
-        """
-        实现 LLMClient 的标准接口
-        注意：网页版对话通常有上下文记忆，因此这里我们只提取 messages 中的最后一条用户消息发送。
-        """
-        await self._ensure_page_ready()
-        page = self._page
-
-        # 1. 解析输入：处理特殊的 System + User 拼接逻辑
-        if len(messages) == 2 and messages[0].get('role') == 'system' and messages[1].get('role') == 'user':
-            # 如果只有两条，且是 System + User，进行拼接
-            system_content = messages[0].get('content', '')
-            user_content = messages[1].get('content', '')
-            system_content = system_content.replace("- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n", "- **重要！要把 <cmd>...</cmd> 放进 5 个反引号组成的 Markdown 代码块中**（要用 ````` 包裹）。\n")
-            prompt = f"""{system_content}\n\n提示：**重要！不要随便输出<cmd>...</cmd>**，因为只要输出<cmd>...</cmd>，就被视为要执行命令。**重要！输出<cmd>...</cmd>时记得换行**，<cmd>和</cmd>要单独占一行。\n\n用户消息：\n{user_content}"""
-        else:
-            # 否则：提取最后一条 user 消息
-            prompt = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
-
-        if not prompt:
-            raise ValueError("messages 中没有找到有效的 user 消息内容")
-
-        timeout_ms = 1000 * 60 * 10 # 10分钟超时
-
-        input_box  = page.locator('div#prompt-textarea.ProseMirror[contenteditable="true"]')
-        
-        # 等编辑器可用
-        await expect(input_box).to_be_visible()
-        await input_box.click()
-
-        # 对 contenteditable 直接 fill
-        await input_box.fill(prompt)
-
-        send_btn = page.get_by_test_id("send-button")
-        stop_btn = page.get_by_test_id("stop-button")
-
-        # 点发送前确保按钮可用
-        await expect(send_btn).to_be_enabled()
-        await send_btn.click()
-
-        # 关键：先等 stop 出现（确保真的开始生成），再等它消失
-        await expect(stop_btn).to_be_visible(timeout=5000)
-        await expect(stop_btn).to_be_hidden(timeout=timeout_ms)
-
-        last = page.locator(self.assistant_bubble_selector).last
-        
-        answer_html = await last.evaluate("""(node) => {
-            // 深拷贝节点，防止影响页面实际显示
-            const clone = node.cloneNode(true);
-            
-            // 定义需要移除的选择器
-            const selectorsToRemove = [
-            ];
-
-            selectorsToRemove.forEach(selector => {
-                const elements = clone.querySelectorAll(selector);
-                elements.forEach(el => el.remove());
-            });
-
-            // 返回清洗后的文本 (innerText) 或 HTML (innerHTML)
-            return clone.innerHTML.trim();
-        }""")
-
-        # 8. 转换为 Markdown
-        markdown_text = self.html_to_markdown(answer_html)
-        
-        markdown_text = self.remove_markdown_code_blocks(markdown_text)
-
-        return markdown_text
-
-    async def close(self):
-        """清理资源"""
         if self._browser:
             await self._browser.close()
         if self._playwright:
@@ -1287,6 +549,294 @@ class ChatGPTSDKClient(LLMClient):
         self._browser = None
         self._playwright = None
         self._page = None
+
+    def build_prompt(self, messages: List[Message]) -> str:
+        raise NotImplementedError
+
+    async def chat_once(self, prompt: str) -> str:
+        """return answer html"""
+        raise NotImplementedError
+
+    def postprocess_markdown(self, md: str) -> str:
+        return md
+
+    async def stream_chat(self, messages: List[Message]) -> str:
+        await self._ensure_page_ready()
+        prompt = self.build_prompt(messages)
+        html = await self.chat_once(prompt)
+        md = self.html_to_markdown(html)
+        return self.postprocess_markdown(md)
+
+
+class ChatZAISDKClient(PlaywrightMarkdownClientBase):
+    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", url: str = "https://chat.z.ai"):
+        super().__init__(cdp_url, url, fence_default="```", dynamic_fence=True)
+        self.input_selector = "#chat-input"
+        self.assistant_bubble_selector = "#response-content-container"
+
+    def build_prompt(self, messages: List[Message]) -> str:
+        # 恢复你原来更“工程化”的提示拼接
+        if len(messages) == 2 and messages[0].get("role") == "system" and messages[1].get("role") == "user":
+            system_content = content_to_text(messages[0].get("content", ""))
+            user_content = content_to_text(messages[1].get("content", ""))
+            return (
+                f"{system_content}\n\n"
+                "提示：记得，你拥有搜索网络的工具：search、open、click、find，合理利用它们。\n"
+                "提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n"
+                f"用户消息：\n{user_content}"
+            )
+
+        prompt = last_user_text(messages)
+        if not prompt:
+            raise ValueError("messages 中没有找到有效的 user 消息内容")
+        return prompt
+
+    async def chat_once(self, prompt: str) -> str:
+        assert self._page is not None
+        page = self._page
+
+        timeout_ms = 1000 * 60 * 10
+
+        input_box = page.locator(self.input_selector)
+        assistant_bubbles = page.locator(self.assistant_bubble_selector)
+
+        await input_box.wait_for(state="visible")
+        await input_box.click()
+        await input_box.fill(prompt)
+        await page.locator("#send-message-button").click()
+
+        await page.locator("#send-message-button").wait_for(state="attached", timeout=timeout_ms)
+        last_bubble = assistant_bubbles.nth(-1)
+
+        # 去掉思考过程等噪音
+        html_content = await last_bubble.locator("> div").first.evaluate(
+            """(node) => {
+            const clone = node.cloneNode(true);
+            const selectorsToRemove = [
+                '.thinking-chain-container',
+                '.thinking-block',
+                '.w-full.overflow-hidden.h-0',
+                '.cursor-default'
+            ];
+            selectorsToRemove.forEach(selector => {
+                const elements = clone.querySelectorAll(selector);
+                elements.forEach(el => el.remove());
+            });
+            return clone.innerHTML.trim();
+        }"""
+        )
+        return html_content
+
+
+class DeepSeekSDKClient(PlaywrightMarkdownClientBase):
+    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", url: str = "https://chat.deepseek.com"):
+        super().__init__(cdp_url, url, fence_default="```", dynamic_fence=True)
+        self.input_selector = 'textarea[placeholder="给 DeepSeek 发送消息 "]'
+        self.assistant_bubble_selector = "div.ds-markdown"
+
+    def build_prompt(self, messages: List[Message]) -> str:
+        if len(messages) == 2 and messages[0].get("role") == "system" and messages[1].get("role") == "user":
+            system_content = content_to_text(messages[0].get("content", ""))
+            user_content = content_to_text(messages[1].get("content", ""))
+            return (
+                f"{system_content}\n\n"
+                "提示：**重要！不要随便输出<cmd>...</cmd>**，因为只要输出<cmd>...</cmd>，就被视为要执行命令。"
+                "**重要！输出<cmd>...</cmd>时记得换行**，<cmd>和</cmd>要单独占一行。\n"
+                "提示：如果你遇到架构方面的决策或者没有把握解决的bug或者尝试多次无法解决的bug，你可以询问gpt5.2-high，具体方法是：你在AI工作目录新建一个文件，将要提供给gpt5.2-high的信息写入那个文件，然后你运行/usr/bin/code-server，记得不要设置密码，然后你告诉用户我需要询问gpt5.2-high这个情况，然后你停止执行任何命令。用户会人工介入，拿着你要提供给gpt5.2-high的信息，从gpt5.2-high得到回复，然后将回复提供给你。\n\n"
+                f"用户消息：\n{user_content}"
+            )
+
+        prompt = last_user_text(messages)
+        if not prompt:
+            raise ValueError("messages 中没有找到有效的 user 消息内容")
+        return prompt
+
+    async def chat_once(self, prompt: str) -> str:
+        assert self._page is not None
+        page = self._page
+
+        timeout_ms = 1000 * 60 * 10
+
+        input_box = page.locator(self.input_selector)
+        assistant_bubbles = page.locator(self.assistant_bubble_selector)
+
+        await input_box.wait_for(state="visible")
+        await input_box.click()
+        await input_box.fill(prompt)
+
+        await page.locator(
+            'path[d="M8.3125 0.981587C8.66767 1.0545 8.97902 1.20558 9.2627 1.43374C9.48724 1.61438 9.73029 1.85933 9.97949 2.10854L14.707 6.83608L13.293 8.25014L9 3.95717V15.0431H7V3.95717L2.70703 8.25014L1.29297 6.83608L6.02051 2.10854C6.26971 1.85933 6.51277 1.61438 6.7373 1.43374C6.97662 1.24126 7.28445 1.04542 7.6875 0.981587C7.8973 0.94841 8.1031 0.956564 8.3125 0.981587Z"]'
+        ).click()
+
+        await expect(
+            page.locator(
+                'path[d="M8.3125 0.981587C8.66767 1.0545 8.97902 1.20558 9.2627 1.43374C9.48724 1.61438 9.73029 1.85933 9.97949 2.10854L14.707 6.83608L13.293 8.25014L9 3.95717V15.0431H7V3.95717L2.70703 8.25014L1.29297 6.83608L6.02051 2.10854C6.26971 1.85933 6.51277 1.61438 6.7373 1.43374C6.97662 1.24126 7.28445 1.04542 7.6875 0.981587C7.8973 0.94841 8.1031 0.956564 8.3125 0.981587Z"]'
+            )
+        ).to_be_visible(timeout=timeout_ms)
+
+        # 原代码这里写了 asyncio.sleep(1) 但没 await；修正
+        await asyncio.sleep(1)
+
+        last = assistant_bubbles.nth(-1)
+        answer_html = await last.evaluate(
+            """(node) => {
+            const clone = node.cloneNode(true);
+            const selectorsToRemove = ['.md-code-block-banner-wrap'];
+            selectorsToRemove.forEach(selector => {
+                const elements = clone.querySelectorAll(selector);
+                elements.forEach(el => el.remove());
+            });
+            return clone.innerHTML.trim();
+        }"""
+        )
+        return answer_html
+
+
+class LmarenaSDKClient(PlaywrightMarkdownClientBase):
+    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", url: str = "https://lmarena.ai"):
+        # fence 用 5 个反引号（保持你原策略）
+        super().__init__(cdp_url, url, fence_default="`````", dynamic_fence=False)
+        self.assistant_bubble_selector = r"div.no-scrollbar.relative.flex.w-full.flex-1.flex-col.overflow-x-auto.transition-\[max-height\].duration-300"
+
+    def remove_markdown_code_blocks(self, text: str):
+        pattern = r"^\s*`````[a-zA-Z]*\n?|`````\s*$"
+        return re.sub(pattern, "", text.strip(), flags=re.MULTILINE).strip()
+
+    def build_prompt(self, messages: List[Message]) -> str:
+        if len(messages) == 2 and messages[0].get("role") == "system" and messages[1].get("role") == "user":
+            system_content = content_to_text(messages[0].get("content", ""))
+            user_content = content_to_text(messages[1].get("content", ""))
+
+            # ===== 恢复你指出的关键 replace =====
+            system_content = system_content.replace(
+                "- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n",
+                "- **重要！要把 <cmd>...</cmd> 放进 5 个反引号组成的 Markdown 代码块中**（要用 ````` 包裹）。\n",
+            )
+
+            return (
+                f"{system_content}\n\n"
+                "提示：**重要！不要随便输出<cmd>...</cmd>**，因为只要输出<cmd>...</cmd>，就被视为要执行命令。"
+                "**重要！输出<cmd>...</cmd>时记得换行**，<cmd>和</cmd>要单独占一行。\n\n"
+                f"用户消息：\n{user_content}"
+            )
+
+        prompt = last_user_text(messages)
+        if not prompt:
+            raise ValueError("messages 中没有找到有效的 user 消息内容")
+        return prompt
+
+    async def chat_once(self, prompt: str) -> str:
+        assert self._page is not None
+        page = self._page
+
+        timeout_ms = 1000 * 60 * 10
+
+        if await page.get_by_role("textbox", name="Ask anything…").is_visible():
+            input_box = page.get_by_role("textbox", name="Ask anything…")
+        else:
+            input_box = page.get_by_role("textbox", name="Ask followup…")
+
+        message_count = await page.locator('button[aria-label="Like this response"]').count()
+
+        await input_box.wait_for(state="visible")
+        await input_box.click()
+        await input_box.fill(prompt)
+
+        if await page.locator('button[type="submit"]').first.is_visible():
+            await page.locator('button[type="submit"]').first.click()
+        elif await page.locator('button[type="submit"]').nth(1).is_visible():
+            await page.locator('button[type="submit"]').nth(1).click()
+
+        await expect(page.locator('button[aria-label="Like this response"]')).to_have_count(message_count + 1, timeout=timeout_ms)
+
+        last = page.locator(self.assistant_bubble_selector).nth(0)
+
+        answer_html = await last.evaluate(
+            """(node) => {
+            const clone = node.cloneNode(true);
+            const selectorsToRemove = [];
+            selectorsToRemove.forEach(selector => {
+                const elements = clone.querySelectorAll(selector);
+                elements.forEach(el => el.remove());
+            });
+            return clone.innerHTML.trim();
+        }"""
+        )
+        return answer_html
+
+    def postprocess_markdown(self, md: str) -> str:
+        return self.remove_markdown_code_blocks(md)
+
+
+class ChatGPTSDKClient(PlaywrightMarkdownClientBase):
+    def __init__(self, cdp_url: str = "http://127.0.0.1:9222", url: str = "https://chatgpt.com"):
+        super().__init__(cdp_url, url, fence_default="`````", dynamic_fence=False)
+        self.assistant_bubble_selector = r'div[data-message-author-role="assistant"]'
+
+    def remove_markdown_code_blocks(self, text: str):
+        pattern = r"^\s*`````[a-zA-Z]*\n?|`````\s*$"
+        return re.sub(pattern, "", text.strip(), flags=re.MULTILINE).strip()
+
+    def build_prompt(self, messages: List[Message]) -> str:
+        if len(messages) == 2 and messages[0].get("role") == "system" and messages[1].get("role") == "user":
+            system_content = content_to_text(messages[0].get("content", ""))
+            user_content = content_to_text(messages[1].get("content", ""))
+
+            # ===== 保持与 lmarena 同样的关键 replace =====
+            system_content = system_content.replace(
+                "- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n",
+                "- **重要！要把 <cmd>...</cmd> 放进 5 个反引号组成的 Markdown 代码块中**（要用 ````` 包裹）。\n",
+            )
+
+            return (
+                f"{system_content}\n\n"
+                "提示：**重要！不要随便输出<cmd>...</cmd>**，因为只要输出<cmd>...</cmd>，就被视为要执行命令。"
+                "**重要！输出<cmd>...</cmd>时记得换行**，<cmd>和</cmd>要单独占一行。\n\n"
+                f"用户消息：\n{user_content}"
+            )
+
+        prompt = last_user_text(messages)
+        if not prompt:
+            raise ValueError("messages 中没有找到有效的 user 消息内容")
+        return prompt
+
+    async def chat_once(self, prompt: str) -> str:
+        assert self._page is not None
+        page = self._page
+
+        timeout_ms = 1000 * 60 * 10
+
+        input_box = page.locator('div#prompt-textarea.ProseMirror[contenteditable="true"]')
+        await expect(input_box).to_be_visible()
+        await input_box.click()
+        await input_box.fill(prompt)
+
+        send_btn = page.get_by_test_id("send-button")
+        stop_btn = page.get_by_test_id("stop-button")
+
+        await expect(send_btn).to_be_enabled()
+        await send_btn.click()
+
+        await expect(stop_btn).to_be_visible(timeout=5000)
+        await expect(stop_btn).to_be_hidden(timeout=timeout_ms)
+
+        last = page.locator(self.assistant_bubble_selector).last
+        answer_html = await last.evaluate(
+            """(node) => {
+            const clone = node.cloneNode(true);
+            const selectorsToRemove = [];
+            selectorsToRemove.forEach(selector => {
+                const elements = clone.querySelectorAll(selector);
+                elements.forEach(el => el.remove());
+            });
+            return clone.innerHTML.trim();
+        }"""
+        )
+        return answer_html
+
+    def postprocess_markdown(self, md: str) -> str:
+        return self.remove_markdown_code_blocks(md)
+
 
 class VDivider(Static):
     def on_mount(self) -> None:
@@ -1340,25 +890,22 @@ class CmdAIDevApp(App):
     def __init__(self) -> None:
         super().__init__()
         self.session = Session.load_or_create()
-        # OpenAISDKClient API的形式，支持OpenAI API格式的API
-        # ChatZAISDKClient https://chat.z.ai 网站的形式
-        # DeepSeekSDKClient https://chat.deepseek.com 网站的形式
-        # LmarenaSDKClient https://lmarena.ai 网站的形式
-        # ChatGPTSDKClient https://chatgpt.com 网站的形式
+
+        # OpenAISDKClient 支持视觉注入
         self.llm: LLMClient = OpenAISDKClient()
         # self.llm: LLMClient = ChatZAISDKClient()
         # self.llm: LLMClient = DeepSeekSDKClient()
         # self.llm: LLMClient = LmarenaSDKClient()
         # self.llm: LLMClient = ChatGPTSDKClient()
+
         self.runner = CommandRunner()
 
         self.busy: bool = False
         self.stop_requested: bool = False
 
         self.pending_user_buffer: List[str] = []
-        self.queue: asyncio.Queue[Tuple[str, str]] = asyncio.Queue()
+        self.queue: asyncio.Queue[Tuple[str, MessageContent]] = asyncio.Queue()
 
-        # reset 时 bump：让 reset 前的 LLM/命令结果全部自动作废
         self.epoch: int = 0
 
     def compose(self) -> ComposeResult:
@@ -1377,14 +924,11 @@ class CmdAIDevApp(App):
     def _left(self) -> RichLog:
         return self.query_one("#left", RichLog)
 
-    # ===== 输出：trusted vs untrusted =====
     def write_left_markup(self, text: str) -> None:
-        """可信内容：允许 rich markup（你自己写的 [b red]...[/b red] 等）。"""
         self._left().write(text)
         append_transcript(str(text))
 
     def write_left_text(self, text: str) -> None:
-        """不可信内容：用 Text() 绕过 markup 解析，避免 [..] 触发富文本标签。"""
         self._left().write(Text(text))
         append_transcript(str(text))
 
@@ -1392,7 +936,6 @@ class CmdAIDevApp(App):
         self._left().write(Markdown(md_text))
         append_transcript(md_text)
 
-    # ===== pending flush / queue drain =====
     def _drain_queue(self) -> None:
         while True:
             try:
@@ -1402,15 +945,12 @@ class CmdAIDevApp(App):
                 break
 
     def _flush_pending_as_user_turn(self) -> None:
-        """把 busy 期间用户发送的内容作为下一条 user 消息送给模型（避免卡住/丢失）。"""
         if not self.pending_user_buffer:
             return
         pending = "\n".join(self.pending_user_buffer).strip()
         self.pending_user_buffer.clear()
         if not pending:
             return
-
-        # 重要：pending 等价于“用户继续对话”，不应该被旧的 stop 标记影响
         self.stop_requested = False
         self.queue.put_nowait(("user", pending))
 
@@ -1429,7 +969,7 @@ class CmdAIDevApp(App):
             self.write_left_markup("[b magenta]</cmd>[/b magenta]")
             self.write_left_markup(f"[dim]timeout={timeout_sec}s[/dim]\n")
 
-    def render_user_content(self, user_text: str) -> None:
+    def _render_user_text_only(self, user_text: str) -> None:
         m = CMDOUT_BLOCK_RE.search(user_text or "")
         if m:
             inner = m.group(1).strip()
@@ -1443,9 +983,24 @@ class CmdAIDevApp(App):
         else:
             self.write_left_text((user_text or "").strip() + "\n")
 
+    def render_user_content(self, user_content: MessageContent) -> None:
+        if isinstance(user_content, str):
+            self._render_user_text_only(user_content)
+            return
+
+        text = content_to_text(user_content)
+        self._render_user_text_only(text)
+
+        img_n = 0
+        for part in user_content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                img_n += 1
+        if img_n:
+            self.write_left_markup(f"[dim](attached images: {img_n}; base64 not shown)[/dim]\n")
+
     def replay_history_to_left(self) -> None:
         max_n = int(os.environ.get("CMD_AI_DEV_REPLAY", "80"))
-        history = self.session.messages[1:]  # skip system
+        history = self.session.messages[1:]
         if max_n > 0 and len(history) > max_n:
             history = history[-max_n:]
 
@@ -1463,7 +1018,10 @@ class CmdAIDevApp(App):
                 self.render_user_content(content)
             elif role == "assistant":
                 self.write_left_markup("[b cyan]assistant:[/b cyan]")
-                self.render_assistant_content(content)
+                if isinstance(content, str):
+                    self.render_assistant_content(content)
+                else:
+                    self.write_left_text(content_to_text(content) + "\n")
             else:
                 continue
 
@@ -1474,12 +1032,16 @@ class CmdAIDevApp(App):
         if not TRANSCRIPT_PATH.exists():
             TRANSCRIPT_PATH.write_text("", encoding="utf-8")
 
+        # 防止上次异常退出残留图片导致误注入
+        clear_look_imgs_json()
+
         self.write_left_markup("[b]cmd-ai-dev[/b]  Ctrl+S发送 | Ctrl+T停止 | Ctrl+R重置 | Ctrl+Q退出 | F2发送")
         self.write_left_text(f"WORKSPACE={WORKSPACE}\n")
         self.write_left_text(f"WORKSPACE_AI={WORKSPACE_AI}\n")
         self.write_left_text(f"SESSION={SESSION_PATH}\n")
         self.write_left_text(f"VENV_BIN={VENV_BIN}\n")
         self.write_left_text(f"TRANSCRIPT={TRANSCRIPT_PATH}\n")
+        self.write_left_text(f"LOOK_IMGS_JSON={LOOK_IMGS_JSON_PATH}\n")
         self.write_left_text("\n")
 
         if len(self.session.messages) > 1:
@@ -1491,6 +1053,7 @@ class CmdAIDevApp(App):
     async def shutdown(self) -> None:
         self.stop_requested = True
         await self.runner.interrupt()
+        clear_look_imgs_json()
         try:
             self.session.save()
         except Exception:
@@ -1525,7 +1088,6 @@ class CmdAIDevApp(App):
             role, content = await self.queue.get()
             my_epoch = self.epoch
 
-            # 这条 user 消息进入会话（如果之后 reset 删除 session.json，也会被清掉）
             self.session.add(role, content)
             self.busy = True
 
@@ -1534,42 +1096,34 @@ class CmdAIDevApp(App):
             try:
                 assistant_text = await self.llm.stream_chat(self.session.messages)
             except Exception as e:
-                # LLM 出错：结束 busy，并把 pending 继续送出去（否则 pending 卡死）
                 self.write_left_markup(f"[b red]LLM error:[/b red] {e}\n")
                 self.busy = False
                 if my_epoch == self.epoch:
                     self._flush_pending_as_user_turn()
                 continue
 
-            # reset 期间产生的旧结果：直接作废，不写 UI、不写 session、不执行命令
             if my_epoch != self.epoch:
                 self.busy = False
                 continue
 
-            # 存 raw（含 <cmd>）到会话
             self.session.add("assistant", assistant_text)
 
             parsed = parse_assistant(assistant_text)
-
             narrative = parsed.answer_without_cmd.strip()
             if narrative:
                 self.write_left_markdown(narrative)
                 self.write_left_text("\n")
 
-            # STOP：允许输出完“模型文字”，但不执行命令
             if self.stop_requested:
+                clear_look_imgs_json()
                 note = (
                     "<system_note>\n"
                     "用户触发 STOP：已停止命令链；任何待执行命令已取消；如需继续，请等待用户新指令。\n"
                     "</system_note>"
                 )
-                # 仍记录到会话，作为模型下一轮上下文
                 self.session.add("user", note)
-
                 self.write_left_markup("[yellow]STOP 已触发：不会执行模型给出的命令。[/yellow]\n")
                 self.busy = False
-
-                # 关键：本轮结束时把 busy 期间用户输入 flush 掉，避免 pending 卡死
                 self._flush_pending_as_user_turn()
                 continue
 
@@ -1588,12 +1142,12 @@ class CmdAIDevApp(App):
 
             result = await self.runner.run(cmd_to_run, timeout_sec=timeout_sec, cwd=WORKSPACE)
 
-            # reset 期间的旧结果：作废
             if my_epoch != self.epoch:
                 self.busy = False
                 continue
 
             if self.stop_requested or result.interrupted:
+                clear_look_imgs_json()
                 note = (
                     "<system_note>\n"
                     "用户触发 STOP：命令执行已中断/结果丢弃；请等待用户新指令。\n"
@@ -1602,7 +1156,6 @@ class CmdAIDevApp(App):
                 self.session.add("user", note)
                 self.write_left_markup("[yellow]STOP：命令结果未发送给模型。[/yellow]\n")
                 self.busy = False
-
                 self._flush_pending_as_user_turn()
                 continue
 
@@ -1629,8 +1182,26 @@ class CmdAIDevApp(App):
                 output=result.output,
                 extra_note=extra_note,
             )
+            next_user_text = (cmdout_msg + user_extra).strip()
 
-            self.queue.put_nowait(("user", (cmdout_msg + user_extra).strip()))
+            # ===== vision injection: only for OpenAISDKClient =====
+            if isinstance(self.llm, OpenAISDKClient):
+                imgs = read_look_imgs_json()
+                if imgs:
+                    clear_look_imgs_json()
+                    next_user_content: MessageContent = build_openai_vision_user_content(next_user_text, imgs)
+                else:
+                    next_user_content = next_user_text
+            else:
+                # 其他模型不支持视觉：若产生了 look_imgs.json，清空并提示
+                if LOOK_IMGS_JSON_PATH.exists() and LOOK_IMGS_JSON_PATH.read_text(encoding="utf-8", errors="replace").strip():
+                    clear_look_imgs_json()
+                    self.write_left_markup(
+                        "[yellow]提示：检测到 look_imgs.json（图片 base64），但当前模型不是 OpenAI 视觉模型；已清空该文件，且不会注入到消息中。[/yellow]\n"
+                    )
+                next_user_content = next_user_text
+
+            self.queue.put_nowait(("user", next_user_content))
 
     async def handle_send(self) -> None:
         ta = self.query_one("#right", TextArea)
@@ -1640,7 +1211,6 @@ class CmdAIDevApp(App):
 
         ta.text = ""
 
-        # 新一轮对话开始，清掉 stop 标记
         if not self.busy:
             self.stop_requested = False
 
@@ -1664,24 +1234,22 @@ class CmdAIDevApp(App):
         self.queue.put_nowait(("user", text))
 
     async def handle_stop(self) -> None:
-        # STOP 不 bump epoch：目的是“让模型输出完文字”，但不执行 cmd
         self.stop_requested = True
         await self.runner.interrupt()
+        clear_look_imgs_json()
         self.write_left_markup("[yellow]STOP 请求已发送：将中断命令链（命令会被终止/丢弃）。[/yellow]\n")
 
     async def handle_reset(self) -> None:
-        # reset 需要更强：作废旧结果 + 停命令 + 清队列
         self.epoch += 1
 
-        # 先停命令（不要求停掉 LLM 生成，但 epoch 会让结果作废）
         self.stop_requested = True
         await self.runner.interrupt()
 
-        # 清空队列与 pending，避免 reset 后旧消息继续驱动链路
         self._drain_queue()
         self.pending_user_buffer.clear()
 
-        # 重置会话文件
+        clear_look_imgs_json()
+
         if SESSION_PATH.exists():
             SESSION_PATH.unlink()
 
@@ -1694,21 +1262,15 @@ class CmdAIDevApp(App):
         self.write_left_markup("[b]会话已重置[/b]")
         self.write_left_text(f"SESSION={SESSION_PATH}\n")
 
-        # reset 后不自动 flush pending（已经 clear 了）
 
 def main() -> None:
     WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
 
     stty_state: Optional[str] = None
 
-    # 在 Textual 接管终端之前保存 stty，并关闭 XON/XOFF（否则 Ctrl+S 可能冻住终端）
     if sys.stdin.isatty():
         try:
-            stty_state = subprocess.check_output(
-                ["stty", "-g"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            ).strip()
+            stty_state = subprocess.check_output(["stty", "-g"], stderr=subprocess.DEVNULL, text=True).strip()
             subprocess.run(["stty", "-ixon"], stderr=subprocess.DEVNULL, check=False)
         except Exception:
             stty_state = None
@@ -1716,7 +1278,6 @@ def main() -> None:
     try:
         CmdAIDevApp().run()
     finally:
-        # 无论如何恢复 stty，避免影响用户 shell（Tab/补全等）
         if stty_state and sys.stdin.isatty():
             try:
                 subprocess.run(["stty", stty_state], stderr=subprocess.DEVNULL, check=False)
