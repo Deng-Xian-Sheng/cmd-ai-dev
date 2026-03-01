@@ -160,6 +160,10 @@ def build_openai_vision_user_content(text: str, images: List[Dict[str, Any]]) ->
     return parts
 
 
+def is_truthy(s: str) -> bool:
+    return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 @dataclass
 class Session:
     messages: List[Message]
@@ -173,6 +177,7 @@ class Session:
             f"- 用户项目目录：{WORKSPACE}（映射到宿主机，修改会真实影响项目）\n"
             f"- AI 工作目录：{WORKSPACE_AI}（默认不映射，用于脚本/笔记/中间产物，避免污染仓库）\n"
             f"- 会话上下文文件：{SESSION_PATH}\n"
+            "- 网络：该容器通常以 --network host 启动；因此你在容器内监听 127.0.0.1:PORT 的服务，用户可在宿主机用同样的端口访问。\n"
             "\n"
             "执行命令协议：\n"
             "- 需要工具执行命令时，在回复中输出一个 <cmd>...</cmd> 块。\n"
@@ -188,28 +193,25 @@ class Session:
             "  [exit=退出码 timeout=0/1 interrupted=0/1]\n"
             "  ...命令输出（可能截断）...\n"
             "  </cmdout>\n"
-            "- 命令输出会同时落盘到 /workspace-ai 供用户复制查看。\n"
+            f"- 命令输出会同时落盘到 {WORKSPACE_AI} 供用户复制查看。\n"
             "\n"
-            "视觉（图片输入）工具：\n"
-            "- 你可以让工具执行：look_imgs <img1> <img2> ...  来把图片转为 base64，写入 /workspace-ai/look_imgs.json。\n"
-            "- 警告：look_imgs.json 里是 base64，非常大非常长，不要直接 cat 它。\n"
-            "- 同理：session.json 里也可能包含 base64（图片），也不要直接 cat session.json。\n"
-            "- 若要检查 look_imgs.json，可用：python -c 'import json;print([{\"path\":x.get(\"path\"),\"mime\":x.get(\"mime\"),\"bytes\":x.get(\"bytes\")} for x in json.load(open(\"/workspace-ai/look_imgs.json\"))])'\n"
+            "重要注意事项（避免卡死/爆长输出）：\n"
+            f"- {LOOK_IMGS_JSON_PATH} 里可能包含 base64（很大很长），不要直接 cat。\n"
+            f"- {SESSION_PATH} 里也可能包含 base64（很大很长），不要直接 cat。\n"
             "\n"
             "操作浏览器（有头 + 宿主机可视化）：\n"
-            "- 容器内提供：Google Chrome + Xvfb + x11vnc + noVNC（无需密码）。\n"
-            "- 建议容器启动时加：--shm-size=2g（避免 Chrome 因 /dev/shm 太小而崩溃）。\n"
-            "- 启动 GUI（虚拟显示器 + noVNC）示例：\n"
-            "  start-gui\n"
-            "  然后让用户在宿主机浏览器打开： http://127.0.0.1:6080/vnc.html\n"
-            "- 启动 Chrome（更像真人，供 Playwright 通过 CDP 连接）示例：\n"
-            "  /var/lib/bin/google/chrome/google-chrome --remote-debugging-port=9222 --user-data-dir=/workspace-ai/cdp-profile --no-first-run --no-default-browser-check\n"
-            "  如果你以 root 运行（少见），需要额外加：--no-sandbox\n"
-            "- 你可以用 python playwright 连接：chromium.connect_over_cdp('http://127.0.0.1:9222') 并操作页面。\n"
+            "- 容器内已提供：Google Chrome、Xvfb、x11vnc、noVNC（无需密码）。\n"
+            "- 推荐顺序：\n"
+            "  1) 运行 start-gui 命令启动虚拟显示器 + noVNC；\n"
+            "     然后让用户在宿主机浏览器打开：http://127.0.0.1:6080/vnc.html\n"
+            "  2) 启动 Chrome（更像真人，供 Playwright 通过 CDP 连接）：\n"
+            f"     /var/lib/bin/google/chrome/google-chrome --remote-debugging-port=9222 --user-data-dir={WORKSPACE_AI}/cdp-profile --no-first-run --no-default-browser-check\n"
+            "     说明：容器用户的 UID/GID 通常来自宿主机，通常不是 root；如果当前 UID=0（root），必须额外加 --no-sandbox，否则 Chrome 会报错。\n"
+            "  3) 用 Python Playwright 连接并操作：chromium.connect_over_cdp('http://127.0.0.1:9222')。\n"
             "\n"
             "建议工作方式：\n"
             "- 每次尽量只请求执行一段命令，收到 <cmdout> 后再决定下一步。\n"
-            "- 临时脚本/笔记优先写到 /workspace-ai。\n"
+            f"- 临时脚本/笔记优先写到 {WORKSPACE_AI}。\n"
             "- 如用户触发 STOP，工具会停止命令链并给你 system_note；此时请等待用户新指令。\n"
             "\n"
             f"提示：容器 venv 的 bin 目录通常为 {VENV_BIN}，应优先使用该环境的 python/pip。"
@@ -378,22 +380,92 @@ class LLMClient:
 
 
 class OpenAISDKClient(LLMClient):
+    VISION_SYSTEM_BLOCK = (
+        "视觉（图片查看）工具（仅当你是“支持视觉的模型”时可用）：\n"
+        "- 用途：当你需要“看图”理解/排查时，让工具把图片附加到下一条 user 消息中，你就能读取并分析这些图片。\n"
+        "- 只有在支持视觉的模型上，这个工具才有意义；如果模型不支持视觉，使用它会导致请求失败或无效。\n"
+        "- 用法：让工具执行：look_imgs <img1> <img2> ...\n"
+        f"- 该命令会把图片转为 base64 写入：{LOOK_IMGS_JSON_PATH}\n"
+        f"- 警告：{LOOK_IMGS_JSON_PATH} 里是 base64，非常大非常长，不要直接 cat。\n"
+        "- 若要检查 "+LOOK_IMGS_JSON_PATH+"，可用：python -c 'import json;print([{\"path\":x.get(\"path\"),\"mime\":x.get(\"mime\"),\"bytes\":x.get(\"bytes\")} for x in json.load(open(\""+LOOK_IMGS_JSON_PATH+"\"))])'\n"
+    )
+
     def __init__(self) -> None:
         api_key = os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
-        self.model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        self.model = os.environ.get("OPENAI_MODEL", "")
 
         if not api_key:
             raise RuntimeError("缺少环境变量 OPENAI_API_KEY")
 
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.supports_vision = self._decide_supports_vision()
+
+    def _decide_supports_vision(self) -> bool:
+        # 用户可指定：OPENAI_SUPPORTS_VISION=true/false
+        v = os.environ.get("OPENAI_SUPPORTS_VISION", "").strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off"):
+            return False
+
+        return False
+
+    def _messages_with_vision_system_if_needed(self, messages: List[Message]) -> List[Message]:
+        if not self.supports_vision:
+            return messages
+        if not messages:
+            return messages
+        if messages[0].get("role") != "system":
+            return messages
+
+        sys_content = messages[0].get("content", "")
+        if not isinstance(sys_content, str):
+            sys_content = content_to_text(sys_content)
+
+        # 已经注入过就不重复注入
+        if "视觉（图片查看）工具" in sys_content:
+            return messages
+
+        anchor = "操作浏览器（有头 + 宿主机可视化）：\n"
+
+        idx = sys_content.find(anchor)
+        if idx < 0:
+            # 兼容：万一系统提示词里这句后面不是 \n（或被改成 \r\n 等），再尝试不带换行的锚点
+            idx = sys_content.find(anchor.rstrip("\n"))
+
+        if idx < 0:
+            # 找不到锚点：退化为追加到末尾（保持你原本行为）
+            new_sys = sys_content.rstrip() + "\n\n" + self.VISION_SYSTEM_BLOCK
+        else:
+            before = sys_content[:idx]
+            after = sys_content[idx:]  # 从锚点句子开始（包含锚点句子本身）
+
+            # 不改动 before 的原文字，只在末尾“补足”到至少两个换行，确保插入块和上下文隔开
+            trailing_nl = len(before) - len(before.rstrip("\n"))
+            if trailing_nl >= 2:
+                before2 = before
+            elif trailing_nl == 1:
+                before2 = before + "\n"
+            else:
+                before2 = before + "\n\n"
+
+            # 插入块末尾也保证有两个换行，再接回锚点段落
+            block = self.VISION_SYSTEM_BLOCK.rstrip("\n") + "\n\n"
+            new_sys = before2 + block + after
+
+        new0 = dict(messages[0])
+        new0["content"] = new_sys
+        return [new0] + messages[1:]
 
     async def stream_chat(self, messages: List[Message]) -> str:
+        messages_for_api = self._messages_with_vision_system_if_needed(messages)
+
         def _call() -> str:
             acc: List[str] = []
             stream = self.client.chat.completions.create(
                 model=self.model,
-                messages=messages,
+                messages=messages_for_api,
                 temperature=float(os.environ.get("OPENAI_TEMPERATURE", "0.2")),
                 stream=True,
             )
@@ -418,7 +490,6 @@ class PlaywrightMarkdownClientBase(LLMClient):
     - build_prompt(messages) -> str
     - chat_once(prompt) -> html(str)
     - （可选）postprocess_markdown(md) -> str
-    - （可选）custom clean selectors
     """
 
     LANG_PATTERNS = [
@@ -458,7 +529,6 @@ class PlaywrightMarkdownClientBase(LLMClient):
             fence = str(self.options.get("fence_default") or "```")
             dynamic = bool(self.options.get("dynamic_fence", True))
             if dynamic:
-                # 防御：如果代码里包含 fence，就延长 fence
                 while fence in code:
                     fence += "`"
 
@@ -575,7 +645,6 @@ class ChatZAISDKClient(PlaywrightMarkdownClientBase):
         self.assistant_bubble_selector = "#response-content-container"
 
     def build_prompt(self, messages: List[Message]) -> str:
-        # 恢复你原来更“工程化”的提示拼接
         if len(messages) == 2 and messages[0].get("role") == "system" and messages[1].get("role") == "user":
             system_content = content_to_text(messages[0].get("content", ""))
             user_content = content_to_text(messages[1].get("content", ""))
@@ -608,7 +677,6 @@ class ChatZAISDKClient(PlaywrightMarkdownClientBase):
         await page.locator("#send-message-button").wait_for(state="attached", timeout=timeout_ms)
         last_bubble = assistant_bubbles.nth(-1)
 
-        # 去掉思考过程等噪音
         html_content = await last_bubble.locator("> div").first.evaluate(
             """(node) => {
             const clone = node.cloneNode(true);
@@ -674,7 +742,6 @@ class DeepSeekSDKClient(PlaywrightMarkdownClientBase):
             )
         ).to_be_visible(timeout=timeout_ms)
 
-        # 原代码这里写了 asyncio.sleep(1) 但没 await；修正
         await asyncio.sleep(1)
 
         last = assistant_bubbles.nth(-1)
@@ -694,7 +761,6 @@ class DeepSeekSDKClient(PlaywrightMarkdownClientBase):
 
 class LmarenaSDKClient(PlaywrightMarkdownClientBase):
     def __init__(self, cdp_url: str = "http://127.0.0.1:9222", url: str = "https://lmarena.ai"):
-        # fence 用 5 个反引号（保持你原策略）
         super().__init__(cdp_url, url, fence_default="`````", dynamic_fence=False)
         self.assistant_bubble_selector = r"div.no-scrollbar.relative.flex.w-full.flex-1.flex-col.overflow-x-auto.transition-\[max-height\].duration-300"
 
@@ -707,7 +773,6 @@ class LmarenaSDKClient(PlaywrightMarkdownClientBase):
             system_content = content_to_text(messages[0].get("content", ""))
             user_content = content_to_text(messages[1].get("content", ""))
 
-            # ===== 恢复你指出的关键 replace =====
             system_content = system_content.replace(
                 "- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n",
                 "- **重要！要把 <cmd>...</cmd> 放进 5 个反引号组成的 Markdown 代码块中**（要用 ````` 包裹）。\n",
@@ -754,11 +819,6 @@ class LmarenaSDKClient(PlaywrightMarkdownClientBase):
         answer_html = await last.evaluate(
             """(node) => {
             const clone = node.cloneNode(true);
-            const selectorsToRemove = [];
-            selectorsToRemove.forEach(selector => {
-                const elements = clone.querySelectorAll(selector);
-                elements.forEach(el => el.remove());
-            });
             return clone.innerHTML.trim();
         }"""
         )
@@ -782,7 +842,6 @@ class ChatGPTSDKClient(PlaywrightMarkdownClientBase):
             system_content = content_to_text(messages[0].get("content", ""))
             user_content = content_to_text(messages[1].get("content", ""))
 
-            # ===== 保持与 lmarena 同样的关键 replace =====
             system_content = system_content.replace(
                 "- 不要把 <cmd> / <cmdout> 放进 Markdown 代码块（不要用 ``` 包裹）。\n",
                 "- **重要！要把 <cmd>...</cmd> 放进 5 个反引号组成的 Markdown 代码块中**（要用 ````` 包裹）。\n",
@@ -824,11 +883,6 @@ class ChatGPTSDKClient(PlaywrightMarkdownClientBase):
         answer_html = await last.evaluate(
             """(node) => {
             const clone = node.cloneNode(true);
-            const selectorsToRemove = [];
-            selectorsToRemove.forEach(selector => {
-                const elements = clone.querySelectorAll(selector);
-                elements.forEach(el => el.remove());
-            });
             return clone.innerHTML.trim();
         }"""
         )
@@ -891,7 +945,7 @@ class CmdAIDevApp(App):
         super().__init__()
         self.session = Session.load_or_create()
 
-        # OpenAISDKClient 支持视觉注入
+        # OpenAISDKClient 支持视觉注入（但只有 supports_vision=True 才真正启用）
         self.llm: LLMClient = OpenAISDKClient()
         # self.llm: LLMClient = ChatZAISDKClient()
         # self.llm: LLMClient = DeepSeekSDKClient()
@@ -1042,6 +1096,9 @@ class CmdAIDevApp(App):
         self.write_left_text(f"VENV_BIN={VENV_BIN}\n")
         self.write_left_text(f"TRANSCRIPT={TRANSCRIPT_PATH}\n")
         self.write_left_text(f"LOOK_IMGS_JSON={LOOK_IMGS_JSON_PATH}\n")
+        if isinstance(self.llm, OpenAISDKClient):
+            self.write_left_text(f"OPENAI_MODEL={self.llm.model}\n")
+            self.write_left_text(f"OPENAI_SUPPORTS_VISION={int(self.llm.supports_vision)} (env OPENAI_SUPPORTS_VISION=true/false)\n")
         self.write_left_text("\n")
 
         if len(self.session.messages) > 1:
@@ -1184,20 +1241,28 @@ class CmdAIDevApp(App):
             )
             next_user_text = (cmdout_msg + user_extra).strip()
 
-            # ===== vision injection: only for OpenAISDKClient =====
+            # ===== vision injection: only for OpenAISDKClient with supports_vision =====
             if isinstance(self.llm, OpenAISDKClient):
                 imgs = read_look_imgs_json()
                 if imgs:
-                    clear_look_imgs_json()
-                    next_user_content: MessageContent = build_openai_vision_user_content(next_user_text, imgs)
+                    if self.llm.supports_vision:
+                        clear_look_imgs_json()
+                        next_user_content: MessageContent = build_openai_vision_user_content(next_user_text, imgs)
+                    else:
+                        clear_look_imgs_json()
+                        self.write_left_markup(
+                            "[yellow]提示：检测到 look_imgs.json（图片 base64），但当前模型被设置为不支持视觉；已清空该文件，且不会注入到消息中。"
+                            "如确实支持视觉，可设置环境变量 OPENAI_SUPPORTS_VISION=true。[/yellow]\n"
+                        )
+                        next_user_content = next_user_text
                 else:
                     next_user_content = next_user_text
             else:
-                # 其他模型不支持视觉：若产生了 look_imgs.json，清空并提示
+                # 其他模型不支持视觉：若产生了 look_imgs.json，清空并提示（但 system prompt 不会引导它使用 look_imgs）
                 if LOOK_IMGS_JSON_PATH.exists() and LOOK_IMGS_JSON_PATH.read_text(encoding="utf-8", errors="replace").strip():
                     clear_look_imgs_json()
                     self.write_left_markup(
-                        "[yellow]提示：检测到 look_imgs.json（图片 base64），但当前模型不是 OpenAI 视觉模型；已清空该文件，且不会注入到消息中。[/yellow]\n"
+                        "[yellow]提示：检测到 look_imgs.json（图片 base64），但未为当前模型供应商适配视觉；已清空该文件，且不会注入到消息中。[/yellow]\n"
                     )
                 next_user_content = next_user_text
 

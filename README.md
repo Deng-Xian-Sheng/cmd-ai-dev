@@ -29,6 +29,7 @@ docker run -it --rm \
   -e OPENAI_BASE_URL="你的base_url(可选，OpenAI-compatible 时用)" \
   -v "$PWD:/workspace" \
   --shm-size=2g \
+  -e OPENAI_SUPPORTS_VISION="是否支持视觉，填false或true" \
   cmd-ai-dev:latest
 ```
 
@@ -83,6 +84,7 @@ cmd_ai_dev() {
   local OPENAI_API_KEY="填你的key"
   local OPENAI_BASE_URL="填你的base_url（可留空）"
   local OPENAI_MODEL="填你的模型名"
+  local OPENAI_SUPPORTS_VISION="是否支持视觉，填false或true"
   local IMAGE_NAME="${CMD_AI_DEV_IMAGE:-cmd-ai-dev:latest}"
   # ===========================
 
@@ -141,6 +143,7 @@ cmd_ai_dev() {
         -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
         "${base_url_args[@]}" \
         -e "OPENAI_MODEL=$OPENAI_MODEL" \
+        -e "OPENAI_SUPPORTS_VISION=$OPENAI_SUPPORTS_VISION" \
         -e "TERM=${TERM:-xterm-256color}" \
         "$cname" cmd-ai-dev
     else
@@ -159,6 +162,7 @@ cmd_ai_dev() {
       -e "OPENAI_API_KEY=$OPENAI_API_KEY" \
       "${base_url_args[@]}" \
       -e "OPENAI_MODEL=$OPENAI_MODEL" \
+      -e "OPENAI_SUPPORTS_VISION=$OPENAI_SUPPORTS_VISION" \
       -e "TERM=${TERM:-xterm-256color}" \
       -v "$proj_dir:/workspace" \
       --shm-size=2g \
@@ -233,6 +237,9 @@ cmd-ai-dev /path/to/your/project
 - 如果想查看AI工作目录的文件，你可以告诉它“请你运行/usr/bin/code-server，不要设置密码。”
 - 你可以对接OpenAI API之外的任何接口/平台，将它作为支持AI编程工具的模型。
 - 你可以在容器外宿主机上执行`google-chrome --remote-debugging-port=9222 --user-data-dir=./cdp-profile`，这将打开一个浏览器，然后你取消这段代码`self.llm: LLMClient = ChatZAISDKClient()`的注释并重新构建镜像，就可以将 https://chat.z.ai 网站作为支持AI编程工具的模型了。执行命令时，如果找不到google-chrome，你需要指定google-chrome二进制可执行文件的路径。
+- 当你使用网站作为支持AI编程工具的模型时，则无需填写OPENAI_BASE_URL、OPENAI_API_KEY、OPENAI_MODEL、OPENAI_SUPPORTS_VISION。
+- 新增了环境变量OPENAI_SUPPORTS_VISION，它代表模型是否支持视觉，填false或true，暂只对`self.llm: LLMClient = OpenAISDKClient()`做了适配，未适配网站作为支持AI编程工具的模型，因为传图片到网站可能稳定较差，复杂度稍度高。
+- 新增了操作浏览器功能，模型可以操作浏览器来搜索网页或者进行其他浏览器操作了🎉。
 
 ## 致谢
 
