@@ -61,8 +61,11 @@ RUN python3 -m pip install -U pip setuptools wheel \
   "pre-commit>=3.0.0" \
   "python-magic>=0.4.27"
 
+ENV WORKSPACE=/workspace
+ENV WORKSPACE_AI=/workspace-ai
+
 # 准备目录（/workspace 由你 run 时映射进来）
-RUN mkdir -p /workspace /workspace-ai
+RUN mkdir -p ${WORKSPACE} ${WORKSPACE_AI}
 
 COPY cmd-ai-dev.py /usr/local/bin/cmd-ai-dev
 RUN chmod +x /usr/local/bin/cmd-ai-dev
@@ -70,9 +73,6 @@ RUN chmod +x /usr/local/bin/cmd-ai-dev
 COPY look_imgs.py /usr/local/bin/look_imgs
 COPY start-gui /usr/local/bin/start-gui
 RUN chmod +x /usr/local/bin/look_imgs /usr/local/bin/start-gui
-
-ENV WORKSPACE=/workspace
-ENV WORKSPACE_AI=/workspace-ai
 
 # 构建时传入宿主机 uid/gid：--build-arg UID=$(id -u) --build-arg GID=$(id -g)
 ARG UID=1000
@@ -101,12 +101,12 @@ RUN set -eux; \
     echo "ai ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ai; \
     chmod 0440 /etc/sudoers.d/ai
 
-RUN chown -R "${UID}:${GID}" /workspace /workspace-ai /opt/venv
+RUN chown -R "${UID}:${GID}" "${WORKSPACE}" "${WORKSPACE_AI}" /opt/venv
 
 ENV HOME=/home/ai
 
 USER ai
-WORKDIR /workspace
+WORKDIR ${WORKSPACE}
 SHELL ["/usr/bin/zsh", "-lc"]
 
 ENTRYPOINT ["/usr/local/bin/cmd-ai-dev"]
