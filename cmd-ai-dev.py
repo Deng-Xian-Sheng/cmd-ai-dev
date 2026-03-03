@@ -567,7 +567,7 @@ class OpenAISDKClient(LLMClient):
         "- 用法：让工具执行：look_imgs <img1> <img2> ...\n"
         f"- 该命令会把图片转为 base64 写入：{LOOK_IMGS_JSON_PATH}\n"
         f"- 警告：{LOOK_IMGS_JSON_PATH} 里是 base64，非常大非常长，不要直接 cat。\n"
-        "- 若要检查 "+LOOK_IMGS_JSON_PATH+"，可用：python -c 'import json;print([{\"path\":x.get(\"path\"),\"mime\":x.get(\"mime\"),\"bytes\":x.get(\"bytes\")} for x in json.load(open(\""+LOOK_IMGS_JSON_PATH+"\"))])'\n"
+        "- 若要检查 "+str(LOOK_IMGS_JSON_PATH)+"，可用：python -c 'import json;print([{\"path\":x.get(\"path\"),\"mime\":x.get(\"mime\"),\"bytes\":x.get(\"bytes\")} for x in json.load(open(\""+str(LOOK_IMGS_JSON_PATH)+"\"))])'\n"
     )
 
     def __init__(self) -> None:
