@@ -67,6 +67,8 @@ ENV WORKSPACE_AI=/workspace-ai
 # 准备目录（/workspace 由你 run 时映射进来）
 RUN mkdir -p ${WORKSPACE} ${WORKSPACE_AI}
 
+COPY skills /workspace-ai/skills
+
 COPY cmd-ai-dev.py /usr/local/bin/cmd-ai-dev
 RUN chmod +x /usr/local/bin/cmd-ai-dev
 

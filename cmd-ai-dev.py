@@ -27,6 +27,7 @@ import sys
 
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
+import yaml
 
 os.environ["NODE_NO_WARNINGS"] = "1"
 from playwright.async_api import async_playwright, Page, Playwright, Browser, expect  # noqa
@@ -44,6 +45,21 @@ VENV_DIR = Path(os.environ.get("VENV_DIR", "/opt/venv"))
 VENV_BIN = VENV_DIR / "bin"
 
 LOOK_IMGS_JSON_PATH = WORKSPACE_AI / "look_imgs.json"
+
+SKILLS_ROOT = WORKSPACE_AI / "skills"
+SKILLS_MD_NAME = "SKILL.md"
+
+# 你希望插入到这一行的上面（锚点）
+SKILLS_INSERT_ANCHOR = "建议工作方式：\n"
+
+_SKILL_FRONT_MATTER_RE = re.compile(r"\A\s*---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
+
+# 用“可读标题”作为识别旧 skills 块的起点（不需要 BEGIN/END marker）
+# 删除规则：从 “Skills（技能）机制：” 开始，一直删到锚点行之前（不包含锚点行）。
+_SKILLS_BLOCK_REMOVE_RE = re.compile(
+    r"\n{0,2}Skills（技能）机制：.*?(?=\n\s*建议工作方式：\s*\n)",
+    re.DOTALL,
+)
 
 # ====== message content types (support vision) ======
 ContentPart = Dict[str, Any]
@@ -163,13 +179,139 @@ def build_openai_vision_user_content(text: str, images: List[Dict[str, Any]]) ->
 def is_truthy(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
 
+def extract_yaml_front_matter(md_text: str) -> Optional[str]:
+    """提取 SKILL.md 顶部的 YAML front matter（--- ... ---）。失败返回 None。"""
+    if not md_text:
+        return None
+    m = _SKILL_FRONT_MATTER_RE.search(md_text)
+    if not m:
+        return None
+    yaml_raw = (m.group(1) or "").strip()
+    return yaml_raw or None
+
+
+def scan_skills(root: Path) -> List[Dict[str, Any]]:
+    """
+    扫描 /workspace-ai/skills 下的 skill 子目录。
+    返回：[{ "path": "/abs/path", "yaml_raw": "...", "yaml": {...}, "skill_dir_name": "xxx" }, ...]
+    """
+    out: List[Dict[str, Any]] = []
+    if not root.exists() or not root.is_dir():
+        return out
+
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir():
+            continue
+        if child.name.startswith("."):
+            continue
+
+        skill_md = child / SKILLS_MD_NAME
+        if not skill_md.exists() or not skill_md.is_file():
+            continue
+
+        raw_text = skill_md.read_text(encoding="utf-8", errors="replace").strip()
+        if not raw_text:
+            continue
+
+        yaml_raw = extract_yaml_front_matter(raw_text)
+        if not yaml_raw:
+            continue
+
+        try:
+            meta = yaml.safe_load(yaml_raw)
+        except Exception:
+            continue
+
+        if not isinstance(meta, dict) or not meta:
+            continue
+
+        out.append(
+            {
+                "path": str(child.resolve()),
+                "yaml_raw": yaml_raw,
+                "yaml": meta,
+                "skill_dir_name": child.name,
+            }
+        )
+    return out
+
+
+def build_skills_system_prompt_block(skills: List[Dict[str, Any]]) -> str:
+    """
+    生成要注入 system prompt 的 skills 说明块（不含 marker）。
+    注意：本块会被插入到 “建议工作方式：” 段落之前。
+    """
+    lines: List[str] = []
+    lines.append("Skills（技能）机制：")
+    lines.append(f"- skills 根目录：{SKILLS_ROOT}")
+    lines.append("- skills 用于提供可复用的“操作手册/脚本/参考资料”，帮助你在合适的时候按既定流程完成任务。")
+    lines.append("")
+    lines.append("skills 的目录结构（每个子目录是一个 skill）：")
+    lines.append("- your-skill-name/")
+    lines.append("  - SKILL.md：必须存在。由两部分组成：")
+    lines.append("    1) YAML：元数据（name/description 等），用于帮助你判断何时使用该 skill")
+    lines.append("    2) Markdown：详细操作指南/规则/示例（你在执行该 skill 时必须遵循）")
+    lines.append("  - scripts/：可选。存放可执行脚本（python/bash 等），你可以按 SKILL.md 指引运行")
+    lines.append("  - references/：可选。参考资料/接口文档/说明")
+    lines.append("  - assets/：可选。模板、资源文件等")
+    lines.append("")
+    lines.append("如何使用 skills（当用户需求匹配某个 skill 的 description 时）：")
+    lines.append("1) 先阅读该 skill 的 SKILL.md（必要时也阅读 references/）。")
+    lines.append("2) 按 SKILL.md 的步骤/规则执行；需要运行脚本时，优先使用容器 venv 的 python。")
+    lines.append(f"3) 可以把中间产物写到 {WORKSPACE_AI}，避免污染用户项目；需要改项目代码再写 {WORKSPACE}。")
+    lines.append("")
+    lines.append("当前检测到的 skills 列表（每项包含：skill 绝对路径 + SKILL.md 的 YAML 部分）：")
+
+    if not skills:
+        lines.append(f"- （未检测到有效 skills：可能 {WORKSPACE_AI}/skills 不存在，或子目录缺少/不合法的 SKILL.md YAML）")
+        return "\n".join(lines).rstrip()
+
+    for i, s in enumerate(skills, 1):
+        p = s.get("path", "")
+        yraw = s.get("yaml_raw", "") or ""
+        lines.append(f"\n[{i}] skill_path: {p}")
+        lines.append("SKILL.md YAML:")
+        lines.append("```yaml")
+        lines.append(yraw.rstrip())
+        lines.append("```")
+
+    return "\n".join(lines).rstrip()
+
+
+def inject_skills_prompt(system_prompt: str, skills_block: str) -> str:
+    """
+    把 skills_block 插入到 system_prompt 中 “建议工作方式：\\n” 这一行的上面。
+    不使用 BEGIN/END marker；会先清理旧的 skills block（若存在）。
+    """
+    base = system_prompt or ""
+
+    # 1) 清理旧 skills 块（避免重复）
+    base2 = _SKILLS_BLOCK_REMOVE_RE.sub("\n\n", base).rstrip()
+
+    # 2) 找锚点：严格优先带换行的锚点
+    idx = base2.find(SKILLS_INSERT_ANCHOR)
+    if idx < 0:
+        # 兼容：如果系统提示词里换行格式被改了，尝试不带 \n 的定位
+        idx = base2.find("建议工作方式：")
+        if idx < 0:
+            # 按你的要求：不追加到末尾；这里选择“原样返回”（避免放错位置）
+            return base2
+
+    before = base2[:idx].rstrip()
+    after = base2[idx:].lstrip("\n")  # 保留锚点段落本身，但避免多余空行
+
+    block = skills_block.strip()
+
+    # 确保 skills 块与上下文有空行分隔
+    return f"{before}\n\n{block}\n\n{after}"
 
 @dataclass
 class Session:
     messages: List[Message]
 
     @staticmethod
-    def default_system_prompt() -> str:
+    def base_system_prompt() -> str:
+        # 原 default_system_prompt 的内容迁移到这里（不含 skills 注入）
         return (
             "你是一个运行在 Docker 容器里的命令行 AI 编程助手（cmd-ai-dev）。\n"
             "\n"
@@ -218,13 +360,31 @@ class Session:
         )
 
     @classmethod
+    def default_system_prompt(cls) -> str:
+        # base + skills 注入（始终注入，哪怕为空，也会告诉模型机制）
+        base = cls.base_system_prompt()
+        skills = scan_skills(SKILLS_ROOT)
+        skills_block = build_skills_system_prompt_block(skills)
+        return inject_skills_prompt(base, skills_block)
+
+    @classmethod
     def load_or_create(cls) -> "Session":
         WORKSPACE_AI.mkdir(parents=True, exist_ok=True)
         data = load_json(SESSION_PATH)
-        if data and isinstance(data.get("messages"), list):
-            return cls(messages=data["messages"])
-        s = cls(messages=[{"role": "system", "content": cls.default_system_prompt()}])
-        s.save()
+
+        if data and isinstance(data.get("messages"), list) and data["messages"]:
+            s = cls(messages=data["messages"])
+        else:
+            s = cls(messages=[{"role": "system", "content": cls.default_system_prompt()}])
+            s.save()
+
+        # 无论是新会话还是旧会话，都刷新 skills section（便于你新增 skill 后自动生效）
+        try:
+            s.refresh_skills_section()
+        except Exception:
+            # skills 扫描失败不应影响主流程
+            pass
+
         return s
 
     def save(self) -> None:
@@ -234,6 +394,26 @@ class Session:
     def add(self, role: str, content: MessageContent) -> None:
         self.messages.append({"role": role, "content": content})
         self.save()
+
+    def refresh_skills_section(self) -> None:
+        """扫描 /workspace-ai/skills 并把列表更新到 system prompt 的 skills 区块中。"""
+        if not self.messages:
+            return
+        if self.messages[0].get("role") != "system":
+            return
+
+        sys_content = self.messages[0].get("content", "")
+        if not isinstance(sys_content, str):
+            sys_content = content_to_text(sys_content)
+
+        skills = scan_skills(SKILLS_ROOT)
+        skills_block = build_skills_system_prompt_block(skills)
+        new_sys = inject_skills_prompt(sys_content, skills_block)
+
+        if new_sys != sys_content:
+            self.messages[0] = dict(self.messages[0])
+            self.messages[0]["content"] = new_sys
+            self.save()
 
 
 CMD_BLOCK_RE = re.compile(r"<cmd>\s*(.*?)\s*</cmd>", re.DOTALL | re.IGNORECASE)
@@ -1096,6 +1276,11 @@ class CmdAIDevApp(App):
         self.write_left_text(f"VENV_BIN={VENV_BIN}\n")
         self.write_left_text(f"TRANSCRIPT={TRANSCRIPT_PATH}\n")
         self.write_left_text(f"LOOK_IMGS_JSON={LOOK_IMGS_JSON_PATH}\n")
+        self.write_left_text(f"SKILLS_ROOT={SKILLS_ROOT}\n")
+        try:
+            self.write_left_text(f"SKILLS_DETECTED={len(scan_skills(SKILLS_ROOT))}\n")
+        except Exception:
+            self.write_left_text("SKILLS_DETECTED=error\n")
         if isinstance(self.llm, OpenAISDKClient):
             self.write_left_text(f"OPENAI_MODEL={self.llm.model}\n")
             self.write_left_text(f"OPENAI_SUPPORTS_VISION={int(self.llm.supports_vision)} (env OPENAI_SUPPORTS_VISION=true/false)\n")
