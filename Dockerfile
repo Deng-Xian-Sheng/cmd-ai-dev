@@ -2,7 +2,7 @@ FROM docker.cnb.cool/cnb/cool/default-dev-env/dockerfile-caches:ba8c7bf15bfb07de
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   python3 python3-pip python3-venv python3-dev \
-  bash git ca-certificates curl gnupg sudo ffmpeg \
+  bash git ca-certificates curl gnupg sudo ffmpeg file \
   build-essential pkg-config \
   less man-db \
   procps psmisc lsof strace \
