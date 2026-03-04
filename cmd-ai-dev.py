@@ -348,7 +348,7 @@ class Session:
             "  1) 运行 start-gui 命令启动虚拟显示器 + noVNC；\n"
             "     然后让用户在宿主机浏览器打开：http://127.0.0.1:6080/vnc.html\n"
             "  2) 启动 Chrome（更像真人，供 Playwright 通过 CDP 连接）：\n"
-            f"     /var/lib/bin/google/chrome/google-chrome --remote-debugging-port=9222 --user-data-dir={WORKSPACE_AI}/cdp-profile --no-first-run --no-default-browser-check\n"
+            f"     nohup /var/lib/bin/google/chrome/google-chrome --remote-debugging-port=9222 --user-data-dir={WORKSPACE_AI}/cdp-profile --no-first-run --no-default-browser-check >>google-chrome.log 2>&1 &\n"
             "     说明：容器用户的 UID/GID 通常来自宿主机，通常不是 root；如果当前 UID=0（root），必须额外加 --no-sandbox，否则 Chrome 会报错。\n"
             "  3) 用 Python Playwright 连接并操作：chromium.connect_over_cdp('http://127.0.0.1:9222')。\n"
             "\n"
